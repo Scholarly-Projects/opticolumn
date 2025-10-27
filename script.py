@@ -50,8 +50,8 @@ DEBUG_OCR_LAYER = False
 DEBUG_TEXT_POSITIONS = False
 DEBUG_SAVE_INTERMEDIATE = False
 DEBUG_PDFA = False
-COMPRESSION_LEVEL = 25  
-AGGRESSIVE_COMPRESSION = True  # Enable more aggressive compression
+COMPRESSION_LEVEL = 75  
+AGGRESSIVE_COMPRESSION = False  
 
 # ---------------- Logging Setup ----------------
 logging.basicConfig(
