@@ -2,9 +2,10 @@
 brew install pyenv
 
 # Set up pyenv
-echo 'export PYENV_ROOT="$HOME/.pyenv"' >> ~/.bashrc
-echo 'command -v pyenv >/dev/null || export PATH="$PYENV_ROOT/bin:$PATH"' >> ~/.bashrc
-echo 'eval "$(pyenv init -)"' >> ~/.bashrc
+SHELL_RC="$HOME/.$(basename "$SHELL")rc"
+echo 'export PYENV_ROOT="$HOME/.pyenv"' >> "$SHELL_RC"
+echo 'command -v pyenv >/dev/null || export PATH="$PYENV_ROOT/bin:$PATH"' >> "$SHELL_RC"
+echo 'eval "$(pyenv init -)"' >> "$SHELL_RC"
 
 exec "$SHELL"
 
@@ -23,7 +24,7 @@ pip install -r requirements.txt
 
 brew install poppler
 
-pip install --upgrade torch>=2.6 torchvision torchaudio
+pip install --upgrade torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0
 
 python script.py
 
