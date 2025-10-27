@@ -52,28 +52,16 @@ def get_font(size, font_name=None):
     for font_path in possible_fonts:
         try:
             font = ImageFont.truetype(font_path, scaled_size)
-            _font_cache[key] = font
-            return font
-        except (OSError, FileNotFoundError):
-            continue
-    
-    # Fallback to default (bitmap) font if no TTF found
-    font = ImageFont.load_default()
-    _font_cache[key] = font
-    return font
+         1 python review.py[?2004l
+Found 1 OCR-enhanced PDF(s). Creating review images...
 
-def create_review_image(pdf_path, output_path):
-    """
-    Create a side-by-side comparison image:
-    Left: Original PDF page
-    Right: OCR text layer (black text on white background) with adjusted position
-    """
-    try:
-        with fitz.open(pdf_path) as doc:
-            page = doc[0]
-            # Render page to image at original size
-            pix = page.get_pixmap()
-            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+Using rawdict method for mg670_b1-001p001-015_test_copy_final.pdf
+Using words method for mg670_b1-001p001-015_test_copy_final.pdf
+Found 1471 text elements in mg670_b1-001p001-015_test_copy_final.pdf
+Created review image: C/mg670_b1-001p001-015_test_copy_final_review.jpg
+
+All done! Check the 'C/' folder for review images.
+[1m[7m%[27m[1m[0m                                                                                                                                                                                                                           [0m[27m[24m[Jaweymouth@uidaho.edu@uofi-HN2J5TJCW6 opti-doc % [K[?2004hs)
             
             # Try different text extraction methods
             text_data = []
