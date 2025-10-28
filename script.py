@@ -50,7 +50,7 @@ DEBUG_OCR_LAYER = False
 DEBUG_TEXT_POSITIONS = False
 DEBUG_SAVE_INTERMEDIATE = False
 DEBUG_PDFA = False
-COMPRESSION_LEVEL = 75  
+COMPRESSION_LEVEL = 100  
 AGGRESSIVE_COMPRESSION = False  
 
 # ---------------- Logging Setup ----------------
@@ -474,53 +474,30 @@ def create_ocr_layer(images: List[Image.Image], filename: str) -> BytesIO:
                         filtered_lines += 1
                         continue
                     
-                    # Calculate font size based on height
-                    font_size = max(6, min(segment_height * 1.2, 72))
-                    ascent, descent = 0, 0
-                    for trial in range(3):
-                        try:
-                            face = pdfmetrics.getFont(FONT_NAME).face
-                            ascent = face.ascent * font_size / 1000.0
-                            descent = face.descent * font_size / 1000.0
-                            text_height = ascent - descent
-                            if abs(text_height - segment_height) < 2:
-                                break
-                            if text_height == 0:
-                                break
-                            font_size *= segment_height / text_height
-                            font_size = max(6, min(font_size, 72))
-                        except Exception as e:
-                            logger.warning(f"Font metric error: {e}")
-                            break
-                    
-                    # Calculate text width and adjust font size if needed
+                    # Calculate a font size that fits within the segment's height.
+                    # We use a slightly smaller factor (0.9) to ensure it fits inside the box.
+                    font_size = max(6, min(segment_height * 0.9, 72))
+
+                    # Set the font
                     c.setFont(FONT_NAME, font_size)
-                    natural_width = stringWidth(text, FONT_NAME, font_size)
-                    target_width = segment_width
+
+                    # Calculate the baseline (vertical position)
+                    # This logic is generally fine for placing the text correctly.
+                    try:
+                        face = pdfmetrics.getFont(FONT_NAME).face
+                        ascent = face.ascent * font_size / 1000.0
+                        descent = face.descent * font_size / 1000.0
+                    except Exception:
+                        # Fallback if font metrics fail
+                        ascent = font_size * 0.8
+                        descent = font_size * 0.2
                     
-                    # Adjust font size to fill width if necessary
-                    if natural_width > 0 and natural_width < target_width * 0.8:
-                        # Text is too short, try increasing font size
-                        scale_factor = min(2.0, target_width / natural_width)
-                        adjusted_font_size = min(72, font_size * scale_factor)
-                        c.setFont(FONT_NAME, adjusted_font_size)
-                        # Recalculate width with new font size
-                        natural_width = stringWidth(text, FONT_NAME, adjusted_font_size)
-                    
-                    # Calculate baseline position
                     y_baseline = pdf_height - y1 + descent
                     
-                    # Use the full width of the original line segment
-                    # This ensures the text extends to the right edge of the original line
+                    # Create the text object at the starting x-coordinate of the segment
                     text_object = c.beginText(x0, y_baseline)
                     text_object.setFont(FONT_NAME, font_size)
-                    text_object.setCharSpace(0)
-                    
-                    # If the text is shorter than the segment width, adjust character spacing
-                    # to make it span the full width
-                    if natural_width < target_width:
-                        char_space = (target_width - natural_width) / max(1, len(text) - 1)
-                        text_object.setCharSpace(char_space)
+                    # KEY CHANGE: We do NOT set character spacing. Let the text have natural spacing.
                     
                     # Draw the text
                     text_object.textOut(text)
