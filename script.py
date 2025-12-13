@@ -31,7 +31,7 @@ INPUT_DIR = "A"
 OUTPUT_DIR = "B"
 MODELS_DIR = "mlmodels"
 POPPLER_PATH = None
-DPI = 225 
+DPI = 200 
 TROCR_MODELS = {
     "handwritten": "microsoft/trocr-base-handwritten",
     "printed": "microsoft/trocr-base-printed",
@@ -50,7 +50,7 @@ DEBUG_OCR_LAYER = False
 DEBUG_TEXT_POSITIONS = False
 DEBUG_SAVE_INTERMEDIATE = False
 DEBUG_PDFA = False
-COMPRESSION_LEVEL = 100  
+COMPRESSION_LEVEL = 88  
 AGGRESSIVE_COMPRESSION = False  
 
 # ---------------- Logging Setup ----------------
@@ -220,7 +220,8 @@ def flatten_pdf_to_images(input_path: str, temp_pdf_path: str) -> bool:
                 img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                 img_buffer = BytesIO()
                 # Use more aggressive compression level
-                img.save(img_buffer, format="JPEG", quality=COMPRESSION_LEVEL, optimize=True, progressive=True)
+                # In flatten_pdf_to_images:
+                img.save(img_buffer, format="JPEG", quality=COMPRESSION_LEVEL)  # remove optimize/progressive
                 img_buffer.seek(0)
                 img_page = output_pdf.new_page(width=pix.width, height=pix.height)
                 img_page.insert_image(img_page.rect, stream=img_buffer.read())
