@@ -56,3 +56,9 @@ If the script is "killed" by a PDF file, find the file name in the terminal belo
 caffeinate -di python script.py
 
 To continue processing the collection. Otherwise, the **problem file** will be processed and kill the script again. These files in the review folder will be analyzed to troubleshoot the script in future iterations -- but they seem to be around 1 in 300 at the moment.
+
+# If you are getting false positives on blank pages
+
+CONFIDENCE_THRESHOLD           = 0.85
+SINGLE_CHAR_CONFIDENCE_THRESHOLD = 0.85
+MIN_SEGMENT_HEIGHT             = 20
