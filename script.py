@@ -14,7 +14,7 @@ from io import BytesIO
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 import numpy as np
 import logging
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 import torch
 from transformers import TrOCRProcessor, VisionEncoderDecoderModel
 import re
@@ -22,6 +22,9 @@ import platform
 import datetime
 import shutil
 import pikepdf
+import hashlib
+import uuid
+from xml.sax.saxutils import escape as xml_escape
 
 # ---------------- Configuration ----------------
 INPUT_DIR  = "A"
@@ -46,6 +49,29 @@ SRGB_ICC_PATH = "srgb.icc"
 DEBUG_OCR_LAYER         = False
 DEBUG_TEXT_POSITIONS    = False
 DEBUG_SAVE_INTERMEDIATE = False
+
+# ---- Branding / attribution / document metadata ----
+# Written into every output PDF (document properties + XMP) so a derivative
+# can always be traced to the tool, its author, the run that produced it and
+# the exact source file.
+APP_NAME        = "Opticolumn"
+APP_VERSION     = "2026"
+APP_SCRIPT      = Path(__file__).name
+APP_URL         = "https://github.com/Scholarly-Projects/opticolumn"
+APP_AUTHOR      = "Andrew Weymouth"
+APP_INSTITUTION = "University of Idaho"       # the author's affiliation
+APP_LICENSE     = "MIT"
+APP_CREATOR     = f"{APP_NAME} {APP_VERSION} ({APP_URL})"
+APP_CITATION    = f"{APP_AUTHOR}. {APP_NAME} ({APP_VERSION}). {APP_INSTITUTION}. {APP_URL}"
+DOC_SUBJECT     = "OCR processed document"
+DOC_KEYWORDS    = "OCR; historic newspaper; searchable PDF; Opticolumn; Kraken; TrOCR"
+DOC_LANGUAGE    = "en-US"
+OPT_NAMESPACE   = "https://github.com/Scholarly-Projects/opticolumn/ns/"
+KEEP_SOURCE_TITLE_AUTHOR = True   # keep the input PDF's own Title/Author when it has them
+SEGMENTATION_MODEL = "Kraken blla (blla.mlmodel)"
+
+# One id per run: every PDF written by the same invocation shares it.
+RUN_ID = str(uuid.uuid4())
 
 # ---------------- Logging Setup ----------------
 logging.basicConfig(
@@ -111,32 +137,120 @@ def setup_pdfa_resources():
 
 
 # ---------------- XMP Metadata ----------------
-def create_xmp_metadata(title, author, subject, creator, producer, creation_date, modify_date, language="en-US"):
+def _sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+_OPT_PROPERTIES = [
+    ("ToolName",          "Text",    "Name of the tool that produced the OCR text layer"),
+    ("Version",           "Text",    "Version of the tool that produced the OCR text layer"),
+    ("Script",            "Text",    "Script file that produced the OCR text layer"),
+    ("ProjectURL",        "Text",    "Project site of the tool"),
+    ("ToolAuthor",        "Text",    "Author of the tool"),
+    ("ToolAffiliation",   "Text",    "Institutional affiliation of the tool author"),
+    ("ToolLicense",       "Text",    "Licence of the tool"),
+    ("Citation",          "Text",    "Recommended citation for the tool"),
+    ("RunID",             "Text",    "Identifier of the processing run that produced this file"),
+    ("SourceFile",        "Text",    "File name of the source PDF"),
+    ("SourceSHA256",      "Text",    "SHA-256 checksum of the source PDF"),
+    ("RenderDPI",         "Integer", "Resolution at which pages were rendered for OCR"),
+    ("SegmentationModel", "Text",    "Line segmentation model used for OCR"),
+    ("OCRModel",          "Text",    "Text recognition model used for OCR"),
+    ("PagesTotal",        "Integer", "Pages in the document"),
+]
+
+
+def create_xmp_metadata(title, author, subject, keywords, creator, producer,
+                        creation_date, modify_date, language=DOC_LANGUAGE,
+                        opt_values: Optional[Dict[str, str]] = None, source_file: str = "",
+                        doc_id: str = "", instance_id: str = "", event_params: str = ""):
+    """
+    XMP packet for PDF/A-1b.  Standard schemas carry what any repository
+    system reads (title, creator tool, keywords, source, identifiers, a
+    processing-history event); the custom opt: schema carries attribution
+    and run provenance, each property declared in the PDF/A extension
+    schema.  Title/Author/Subject/Keywords/Creator/Producer mirror the
+    document Info dictionary exactly, as PDF/A requires.
+    """
     try:
-        return f"""<?xpacket begin="\xef\xbb\xbf" id="W5M0MpCehiHzreSzNTczkc9d"?>
+        e = lambda v: xml_escape(str(v))
+        ns = e(OPT_NAMESPACE)
+        values = opt_values or {}
+        creator_xml = (f"\n      <dc:creator><rdf:Seq><rdf:li>{e(author)}</rdf:li></rdf:Seq></dc:creator>"
+                       if author else "")
+        source_xml = f"\n      <dc:source>{e(source_file)}</dc:source>" if source_file else ""
+        opt_xml = "\n".join(f"      <opt:{n}>{e(values[n])}</opt:{n}>"
+                            for n, _t, _d in _OPT_PROPERTIES if values.get(n) not in (None, ""))
+        decl_xml = "\n".join(f"""                <rdf:li rdf:parseType="Resource">
+                  <pdfaProperty:name>{n}</pdfaProperty:name>
+                  <pdfaProperty:valueType>{t}</pdfaProperty:valueType>
+                  <pdfaProperty:category>internal</pdfaProperty:category>
+                  <pdfaProperty:description>{e(d)}</pdfaProperty:description>
+                </rdf:li>""" for n, t, d in _OPT_PROPERTIES)
+        return f"""<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/">
   <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
     <rdf:Description rdf:about="" xmlns:pdf="http://ns.adobe.com/pdf/1.3/">
-      <pdf:Producer>{producer}</pdf:Producer>
+      <pdf:Producer>{e(producer)}</pdf:Producer>
+      <pdf:Keywords>{e(keywords)}</pdf:Keywords>
     </rdf:Description>
     <rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/">
-      <dc:title><rdf:Alt><rdf:li xml:lang="x-default">{title}</rdf:li></rdf:Alt></dc:title>
-      <dc:creator><rdf:Seq><rdf:li>{author}</rdf:li></rdf:Seq></dc:creator>
-      <dc:description><rdf:Alt><rdf:li xml:lang="x-default">{subject}</rdf:li></rdf:Alt></dc:description>
-      <dc:language><rdf:Bag><rdf:li>{language}</rdf:li></rdf:Bag></dc:language>
+      <dc:format>application/pdf</dc:format>
+      <dc:title><rdf:Alt><rdf:li xml:lang="x-default">{e(title)}</rdf:li></rdf:Alt></dc:title>{creator_xml}
+      <dc:description><rdf:Alt><rdf:li xml:lang="x-default">{e(subject)}</rdf:li></rdf:Alt></dc:description>
+      <dc:language><rdf:Bag><rdf:li>{e(language)}</rdf:li></rdf:Bag></dc:language>{source_xml}
     </rdf:Description>
     <rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/">
-      <xmp:CreatorTool>{creator}</xmp:CreatorTool>
+      <xmp:CreatorTool>{e(creator)}</xmp:CreatorTool>
       <xmp:CreateDate>{creation_date}</xmp:CreateDate>
       <xmp:ModifyDate>{modify_date}</xmp:ModifyDate>
+      <xmp:MetadataDate>{modify_date}</xmp:MetadataDate>
+    </rdf:Description>
+    <rdf:Description rdf:about=""
+        xmlns:xmpMM="http://ns.adobe.com/xap/1.0/mm/"
+        xmlns:stEvt="http://ns.adobe.com/xap/1.0/sType/ResourceEvent#">
+      <xmpMM:DocumentID>{e(doc_id)}</xmpMM:DocumentID>
+      <xmpMM:InstanceID>{e(instance_id)}</xmpMM:InstanceID>
+      <xmpMM:History>
+        <rdf:Seq>
+          <rdf:li rdf:parseType="Resource">
+            <stEvt:action>converted</stEvt:action>
+            <stEvt:instanceID>{e(instance_id)}</stEvt:instanceID>
+            <stEvt:parameters>{e(event_params)}</stEvt:parameters>
+            <stEvt:softwareAgent>{e(creator)}</stEvt:softwareAgent>
+            <stEvt:when>{modify_date}</stEvt:when>
+          </rdf:li>
+        </rdf:Seq>
+      </xmpMM:History>
     </rdf:Description>
     <rdf:Description rdf:about="" xmlns:pdfaid="http://www.aiim.org/pdfa/ns/id/">
       <pdfaid:part>1</pdfaid:part>
       <pdfaid:conformance>B</pdfaid:conformance>
     </rdf:Description>
-    <rdf:Description rdf:about="" xmlns:opt="http://github.com/Scholarly-Projects/opticolumn/">
-      <opt:ToolName>Opticolumn</opt:ToolName>
-      <opt:Version>2026</opt:Version>
+    <rdf:Description rdf:about="" xmlns:opt="{ns}">
+{opt_xml}
+    </rdf:Description>
+    <rdf:Description rdf:about=""
+        xmlns:pdfaExtension="http://www.aiim.org/pdfa/ns/extension/"
+        xmlns:pdfaSchema="http://www.aiim.org/pdfa/ns/schema#"
+        xmlns:pdfaProperty="http://www.aiim.org/pdfa/ns/property#">
+      <pdfaExtension:schemas>
+        <rdf:Bag>
+          <rdf:li rdf:parseType="Resource">
+            <pdfaSchema:schema>{e(APP_NAME)} processing and attribution metadata</pdfaSchema:schema>
+            <pdfaSchema:namespaceURI>{ns}</pdfaSchema:namespaceURI>
+            <pdfaSchema:prefix>opt</pdfaSchema:prefix>
+            <pdfaSchema:property>
+              <rdf:Seq>
+{decl_xml}
+              </rdf:Seq>
+            </pdfaSchema:property>
+          </rdf:li>
+        </rdf:Bag>
+      </pdfaExtension:schemas>
     </rdf:Description>
   </rdf:RDF>
 </x:xmpmeta>
@@ -144,6 +258,77 @@ def create_xmp_metadata(title, author, subject, creator, producer, creation_date
     except Exception as e:
         logger.error(f"Failed to create XMP metadata: {e}")
         return None
+
+
+def stamp_document_metadata(doc: fitz.Document, filename: str, source_path: Optional[str] = None) -> None:
+    """
+    Document Info dictionary + XMP + viewer prefs.
+
+    Title and Author describe the newspaper, not the tool: the source PDF's
+    own Title/Author are kept when present (KEEP_SOURCE_TITLE_AUTHOR),
+    otherwise Title is the file name and Author is left empty.  The tool,
+    its author, the run and the source checksum are recorded in Creator,
+    Keywords and the XMP opt: properties.
+    """
+    now = datetime.datetime.now()
+    creation_date = get_pdf_date_string(now)
+    xmp_date = get_xmp_date_string(now)
+    producer = "PyMuPDF"
+    src = doc.metadata or {}
+    title = (src.get("title") or "").strip() if KEEP_SOURCE_TITLE_AUTHOR else ""
+    author = (src.get("author") or "").strip() if KEEP_SOURCE_TITLE_AUTHOR else ""
+    title = title or filename
+    doc_id = f"uuid:{uuid.uuid4()}"
+    instance_id = f"uuid:{uuid.uuid4()}"
+
+    sha = ""
+    if source_path:
+        try:
+            sha = _sha256(source_path)
+        except OSError as exc:
+            logger.warning(f"Could not checksum {source_path}: {exc}")
+    opt_values = {
+        "ToolName": APP_NAME, "Version": APP_VERSION, "Script": APP_SCRIPT,
+        "ProjectURL": APP_URL, "ToolAuthor": APP_AUTHOR, "ToolAffiliation": APP_INSTITUTION,
+        "ToolLicense": APP_LICENSE, "Citation": APP_CITATION, "RunID": RUN_ID,
+        "SourceFile": filename, "SourceSHA256": sha,
+        "RenderDPI": str(DPI), "SegmentationModel": SEGMENTATION_MODEL,
+        "OCRModel": TROCR_MODEL_NAME, "PagesTotal": str(len(doc)),
+    }
+    params = f"{APP_SCRIPT}; DPI {DPI}; {SEGMENTATION_MODEL}; OCR {TROCR_MODEL_NAME}; run {RUN_ID}"
+
+    doc.set_metadata({
+        "title":        title,
+        "author":       author,
+        "subject":      DOC_SUBJECT,
+        "keywords":     DOC_KEYWORDS,
+        "creator":      APP_CREATOR,
+        "producer":     producer,
+        "creationDate": creation_date,
+        "modDate":      creation_date,
+    })
+    xmp = create_xmp_metadata(
+        title=title,
+        author=author,
+        subject=DOC_SUBJECT,
+        keywords=DOC_KEYWORDS,
+        creator=APP_CREATOR,
+        producer=producer,
+        creation_date=xmp_date,
+        modify_date=xmp_date,
+        language=DOC_LANGUAGE,
+        opt_values=opt_values,
+        source_file=filename,
+        doc_id=doc_id,
+        instance_id=instance_id,
+        event_params=params,
+    )
+    if xmp:
+        doc.set_xml_metadata(xmp)
+    cat = doc.pdf_catalog()
+    doc.xref_set_key(cat, "ViewerPreferences", "<</DisplayDocTitle true>>")
+    doc.xref_set_key(cat, "Lang", f"({DOC_LANGUAGE})")
+    logger.info(f"Metadata: {APP_CREATOR}, run {RUN_ID}" + (f", source SHA-256 {sha}" if sha else ""))
 
 
 # ---------------- Model Loading ----------------
@@ -502,33 +687,8 @@ def process_single_pdf_ocr(input_path: str, output_path: str) -> bool:
             # ── Run OCR on rendered images ───────────────────────────────────
             ocr_pages = create_ocr_text_elements(pil_images, filename)
 
-# ── Set document metadata ────────────────────────────────────────
-            now           = datetime.datetime.now()
-            creation_date = get_pdf_date_string(now)
-            doc.set_metadata({
-                "title":        filename,
-                "author":       "Opticolumn",
-                "subject":      "OCR processed document",
-                "creator":      "Opticolumn 2026",
-                "producer":     "PyMuPDF",
-                "creationDate": creation_date,
-                "modDate":      creation_date,
-            })
-            xmp = create_xmp_metadata(
-                title=filename,
-                author="Opticolumn",
-                subject="OCR processed document",
-                creator="Opticolumn 2026",
-                producer="PyMuPDF",
-                creation_date=get_xmp_date_string(now),
-                modify_date=get_xmp_date_string(now),
-                language="en-US",
-            )
-            if xmp:
-                doc.set_xml_metadata(xmp)
-            cat = doc.pdf_catalog()
-            doc.xref_set_key(cat, "ViewerPreferences", "<</DisplayDocTitle true>>")
-            doc.xref_set_key(cat, "Lang", "(en-US)")
+            # ── Set document metadata ────────────────────────────────────────
+            stamp_document_metadata(doc, filename, input_path)
 
             # ── Insert invisible text into original pages ────────────────────
             page_count = min(len(doc), len(ocr_pages))
@@ -725,6 +885,9 @@ def compress_to_target_size(input_pdf: Path, output_pdf: Path, original_size: in
 
 # ---------------- Main ----------------
 def main():
+    logger.info(f"{APP_NAME} {APP_VERSION} ({APP_SCRIPT}) by {APP_AUTHOR}, {APP_INSTITUTION} — "
+                f"{APP_LICENSE} licence — {APP_URL}")
+    logger.info(f"Run {RUN_ID}")
     input_folder  = Path(INPUT_DIR)
     output_folder = Path(OUTPUT_DIR)
 
