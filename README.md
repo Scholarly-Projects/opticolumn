@@ -1,10 +1,19 @@
 # opticolumn
 
-OCR tool developed by Andrew Weymouth, Digital Initiatives Librarian for University of Idaho, over summer and fall of 2025. The tool implements the TrOCR text recognition model and the Kraken BLLA page segmentation model to improve the accuracy of handwritten and cursive archival documents and add digital preservation metadata to processed materials. The tool was developed for overhauling the Center for Digital Inquiry and Learning's digital collection PDF files, to make the collection more discoverable and accessible. The development of the tool is written about in greater detail in [_Transparent Practices: OCR and AI in the Archives_](https://journals.sagepub.com/doi/full/10.1177/15501906261439241), by Rebecca Hastings and Andrew Weymouth. _Collections: A Journal for Archives and Museum Professions_, June 2026.
+OCR tool developed by Andrew Weymouth, Digital Initiatives Librarian for University of Idaho, over summer and fall of 2025. The tool implements the TrOCR text recognition model and the Kraken BLLA page segmentation model to improve the accuracy of handwritten and cursive archival documents and add digital preservation metadata to processed materials.
+
+__Opticolumn Optical Character Recognition Kit Practical Applications__
+
+- [Opticolumn](https://github.com/Scholarly-Projects/opticolumn)
+    - Intended for archival scans and designed for type, handwritten text, cursive or a combination of all three. The tool can handle unorthodox arrangements of text, such as annotations and marginalia, but reading order arrangement is not as developed as the following script.
+- [Opticolumns](https://github.com/Scholarly-Projects/opticolumns)
+    - Intended for archival scans of large scale multi-columned materials, such as newspapers. 
+- [Opticolumn_Editor](https://github.com/Scholarly-Projects/opticolumn_editor)
+    - Intended to create OCR using Opticolumn that produces a CSV of the OCR file that can be edited and processed gain to incorporate copy edits into the final embedded layer. This method is recommended if you need to produce OCR that surpasses the 85-95% accuracy benchmarks of Opticolumn and Opticolumns.
 
 ## Additional Scripts
 
-In addition to the script.py OCR code, there are two additional scripts for reviewing and benchmarking output. After the `script.py` generates a new PDF of your original documents in the A folder, the `review.py` generates a jpeg of all of the processed PDF files that have been created in your B folder. These images in the C folder will have the original image of your document on the left hand side and an isolated copy of it's OCR on the right. Only the first page of every document will be produced so you can quickly scan for accuracy of materials and/or adjust TROCR Models or configuration accordingly.
+In addition to the script.py OCR code, there are two additional scripts for reviewing and benchmarking output. After the `script.py` generates a new PDF of your original documents in the A folder, the `review.py` generates a jpeg of all of the processed PDF files that have been created in your B folder. These images in the C folder will have the original image of your document on the left hand side and an isolated copy of it's OCR on the right. Only the first page of every document will be produced so you can quickly scan for accuracy of materials and/or adjust TrOCR Models or configuration accordingly.
 
 Example output:
 
@@ -40,3 +49,9 @@ Before processing, check for page dimensions commonly associated with born-digit
 - 1920x1080 
 
 After processing, review the output files in the B folder. Born-digital PDFs will typically appear largely blank. Remove these files before updating or publishing the processed batch.
+
+## Background
+
+The tool was developed for overhauling the Center for Digital Inquiry and Learning's digital collection PDF files, to make the collection more discoverable and accessible. The development of the tool is written about in greater detail in [_Transparent Practices: OCR and AI in the Archives_](https://journals.sagepub.com/doi/full/10.1177/15501906261439241), by Rebecca Hastings and Andrew Weymouth. _Collections: A Journal for Archives and Museum Professions_, June 2026.
+
+__Also note__: Opticolumn and Opticolumns will only add a layer of PDF/A compliant OCR to a processed file. It does not create a tagging structure, add alt text or any of the other elements a standalone file needs to meet WCAG 2.1 standards.
