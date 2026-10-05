@@ -49,6 +49,17 @@ _To keep your Mac awake during long batches:_
 caffeinate -i python script.py    # prevents idle sleep
 caffeinate -di python script.py   # also keeps the display on
 ```
+## If a file stops the batch
+
+If processing stops with a message ending in `Killed`, a single PDF has used up the computer's memory. The culprit is the file named in the last message before `Killed`.
+
+**To try again**
+- Quit memory-heavy apps (browsers, Adobe apps, Photoshop) and run the script again.
+- Make sure at least 20 GB of disk space is free.
+- As a last resort, split the PDF into smaller sections, process each one, and recombine them.
+
+**To skip the file**
+- Move the culprit file from the `A` folder to the `review` folder, then run the script again.
 
 ## Windows
 
@@ -119,14 +130,12 @@ source .venv/bin/activate
 
 ## If a file stops the batch
 
-If processing stops with a message ending in `Killed`, a single PDF has used up the computer's memory. The culprit is the file in the last `Processing …` line shown in the terminal before `Killed`.
+If processing stops with a message ending in `Killed`, a single PDF has used up the computer's memory. The culprit is the file named in the last message before `Killed`.
 
-1. Move that file from the `A` folder to the `review` folder.
-2. Run the script again. Files already in `B` are skipped, so processing picks up where it stopped.
+**To try again**
+- Quit memory-heavy apps (browsers, Adobe apps, Photoshop) and run the script again.
+- Make sure at least 20 GB of disk space is free.
+- As a last resort, split the PDF into smaller sections, process each one, and recombine them.
 
-```bash
-caffeinate -di python script.py   # macOS
-python script.py                  # Windows (WSL)
-```
-
-If the file is left in `A`, the script will reach it again and stop at the same point. This affects roughly 1 in 300 files; files collected in `review` are used to troubleshoot future versions of the script.
+**To skip the file**
+- Move the culprit file from the `A` folder to the `review` folder, then run the script again.
