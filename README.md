@@ -1,12 +1,12 @@
 # opticolumn
 
 <p align="center">
-  <a href="https://aweymo-ui.github.io/opticolumn-tool-kit/">
-    <img src="https://aweymo-ui.github.io/opticolumn-tool-kit/images/opti_logo.png?v=2" alt="Opticolumn logo of a lighthouse on top of a book with the sea in the distance." width="400">
+  <a href="https://aweymo-ui.github.io/opticolumn-toolkit/">
+    <img src="https://aweymo-ui.github.io/opticolumn-toolkit/images/opti_logo.png?v=2" alt="Opticolumn logo of a lighthouse on top of a book with the sea in the distance." width="400">
   </a>
 </p>
 
-__Opticolumn Tool Kit__
+__Opticolumn Toolkit__
 
 This tool implements the TrOCR text recognition model and the Kraken BLLA page segmentation model to improve the accuracy of handwritten and cursive archival documents and add digital preservation metadata to processed materials.
 
@@ -21,7 +21,7 @@ This tool implements the TrOCR text recognition model and the Kraken BLLA page s
 
 Step-by-step processing instructions are in [setup.md](setup.md).
 
-__Opticolumn Tool Kit Applications__
+__Opticolumn Toolkit Applications__
 
 - [Opticolumn](https://github.com/Scholarly-Projects/opticolumn)
     - Intended for archival scans and designed for type, handwritten text, cursive or a combination of all three. The tool can handle unorthodox arrangements of text, such as annotations and marginalia, but reading order arrangement is not as developed as the following script.
@@ -48,7 +48,7 @@ To understand the overall accuracy of the output, the `report.py` uses regular e
 <details>
 <summary><h2>Note</h2></summary>
 
-The Opticolumn tool kit is designed for **archival scans**, not born-digital PDFs. They add a new PDF/A-compliant OCR layer, or replace an existing one, but they do not add a tagging structure, alt text or the other elements a file needs to meet WCAG 2.1 standards.
+The Opticolumn toolkit is designed for **archival scans**, not born-digital PDFs. They add a new PDF/A-compliant OCR layer, or replace an existing one, but they do not add a tagging structure, alt text or the other elements a file needs to meet WCAG 2.1 standards.
 
 If a born-digital PDF is processed, the tool strips its text and images and leaves a largely blank document. Automatic detection produced too many false positives across the variety of born-digital files, so batches need a quick manual review.
 
@@ -73,6 +73,6 @@ After processing, review the output files in the B folder. Born-digital PDFs wil
 <details>
 <summary><h2>Background</h2></summary>
 
-The Opticolumn tool kit was developed for overhauling the Center for Digital Inquiry and Learning's digital collection PDF files, to make the collection more discoverable and accessible. The development of the original [Opticolumn](https://github.com/Scholarly-Projects/opticolumn) tool is written about in greater detail in [_Transparent Practices: OCR and AI in the Archives_](https://journals.sagepub.com/doi/full/10.1177/15501906261439241), by Rebecca Hastings and Andrew Weymouth. _Collections: A Journal for Archives and Museum Professions_, June 2026.
+The Opticolumn toolkit was developed for overhauling the Center for Digital Inquiry and Learning's digital collection PDF files, to make the collection more discoverable and accessible. The development of the original [Opticolumn](https://github.com/Scholarly-Projects/opticolumn) tool is written about in greater detail in [_Transparent Practices: OCR and AI in the Archives_](https://journals.sagepub.com/doi/full/10.1177/15501906261439241), by Rebecca Hastings and Andrew Weymouth. _Collections: A Journal for Archives and Museum Professions_, June 2026.
 
 </details>
