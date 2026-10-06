@@ -2,7 +2,7 @@
 
 <p align="center">
   <a href="https://aweymo-ui.github.io/opticolumn-tool-kit/">
-    <img src="https://aweymo-ui.github.io/opticolumn-tool-kit/images/opti_logo.png" alt="Opticolumn logo of a lighthouse on top of a book with the sea in the distance." width="400">
+    <img src="https://aweymo-ui.github.io/opticolumn-tool-kit/images/opti_logo.png?v=2" alt="Opticolumn logo of a lighthouse on top of a book with the sea in the distance." width="400">
   </a>
 </p>
 
