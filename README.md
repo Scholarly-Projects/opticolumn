@@ -1,5 +1,11 @@
 # opticolumn
 
+<p align="center">
+  <a href="https://aweymo-ui.github.io/opticolumn-tool-kit/">
+    <img src="https://aweymo-ui.github.io/opticolumn-tool-kit/images/opti_logo.png" alt="Opticolumn logo of a lighthouse on top of a book with the sea in the distance." width="400">
+  </a>
+</p>
+
 __Opticolumn Tool Kit__
 
 This tool implements the TrOCR text recognition model and the Kraken BLLA page segmentation model to improve the accuracy of handwritten and cursive archival documents and add digital preservation metadata to processed materials.
