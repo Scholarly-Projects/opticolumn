@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Opticolumn 
+Opticolumn workflow improvement
 """
 
 import sys
@@ -51,18 +51,10 @@ DEBUG_OCR_LAYER         = False
 DEBUG_TEXT_POSITIONS    = False
 DEBUG_SAVE_INTERMEDIATE = False
 
-# ---- Workflow / memory (modelled on Opticolumns) ----
-# Pages are rendered, OCR'd and written one at a time, so memory use no
-# longer grows with the number of pages in a PDF.  Line crops are read by
-# TrOCR in batches instead of one call per line.
 SKIP_EXISTING_OUTPUT = True  # skip a PDF whose output already exists (checked before models load)
 TROCR_BATCH_SIZE     = 8     # line crops per TrOCR generate() call; lower it if memory is tight
 USE_MPS              = True  # Apple-silicon GPU if available (falls back to CPU on error)
 
-# ---- Branding / attribution / document metadata ----
-# Written into every output PDF (document properties + XMP) so a derivative
-# can always be traced to the tool, its author, the run that produced it and
-# the exact source file.
 APP_NAME        = "Opticolumn"
 APP_VERSION     = "2026"
 APP_SCRIPT      = Path(__file__).name
