@@ -1,0 +1,1464 @@
+#!/usr/bin/env python3
+"""
+Opticolumn — workflow improvement with page segment de-skewing for archival annotations
+"""
+
+import sys
+import os
+import gc
+import math
+from dataclasses import dataclass
+from pathlib import Path
+import fitz
+from kraken import blla
+from kraken.lib.vgsl import TorchVGSLModel
+from PIL import Image, ImageDraw, ImageFilter, ImageOps
+import numpy as np
+import logging
+from typing import Dict, List, Optional, Tuple
+import torch
+from transformers import TrOCRProcessor, VisionEncoderDecoderModel
+import re
+import platform
+import datetime
+import shutil
+import pikepdf
+import hashlib
+import uuid
+from xml.sax.saxutils import escape as xml_escape
+
+# ---------------- Configuration ----------------
+INPUT_DIR  = "A"
+OUTPUT_DIR = "B"
+MODELS_DIR = "mlmodels"
+POPPLER_PATH = None
+DPI = 200
+TROCR_MODELS = {
+    "handwritten":       "microsoft/trocr-base-handwritten",
+    "printed":           "microsoft/trocr-base-printed",
+    "large_handwritten": "microsoft/trocr-large-handwritten",
+    "large_printed":     "microsoft/trocr-large-printed",
+}
+TROCR_MODEL_NAME               = TROCR_MODELS["large_handwritten"]
+ENABLE_PREPROCESSING           = True
+CONFIDENCE_THRESHOLD           = 0.25
+SINGLE_CHAR_CONFIDENCE_THRESHOLD = 0.5
+MIN_SEGMENT_HEIGHT             = 10
+FONT_NAME  = "helv"
+FONT_PATH  = "fonts/FreeSans.ttf"
+SRGB_ICC_PATH = "srgb.icc"
+DEBUG_OCR_LAYER         = False
+DEBUG_TEXT_POSITIONS    = False
+DEBUG_SAVE_INTERMEDIATE = False   # save the deskewed page and each orientation pass to debug_images/
+
+SKIP_EXISTING_OUTPUT = True  # skip a PDF whose output already exists (checked before models load)
+TROCR_BATCH_SIZE     = 8     # line crops per TrOCR generate() call; lower it if memory is tight
+USE_MPS              = True  # Apple-silicon GPU if available (falls back to CPU on error)
+
+# ---- Orientation: page deskew ----
+DESKEW         = True
+MAX_SKEW_DEG   = 5.0    # search range, each direction
+MIN_SKEW_DEG   = 0.15   # smaller angles are left alone (avoids a needless resample)
+SKEW_MIN_GAIN  = 0.03   # best angle must beat 0° by 3% on the projection score to be used
+
+# ---- Orientation: per-line straightening ----
+LINE_STRAIGHTEN       = True
+LINE_DESKEW_MIN_DEG   = 1.0    # lines tilted less than this are not resampled
+LINE_POLYGON_MASK     = True   # whiten everything outside the line's polygon before TrOCR
+LINE_PAD_PX           = 4      # padding around each line crop (pixels)
+ANNOTATION_ANGLE_DEG  = 8.0    # a main-pass line tilted at least this much counts as an annotation
+FLIP_CHECK_DEG        = 60.0   # lines steeper than this are read both ways up
+
+# ---- Orientation: extra segmentation passes for margin notes ----
+# Each angle costs one more Kraken segmentation per page.  Add 45 and 315
+# for documents with many diagonal notes; use () to switch the passes off.
+ORIENTATION_PASSES       = (90, 270)
+ROTATED_MIN_CONFIDENCE   = 0.40   # notes found only by a rotated pass must reach this
+MAX_OVERLAP              = 0.30   # a rotated-pass line overlapping already-read text more than this is dropped
+COVERAGE_SCALE           = 4      # resolution divisor of the overlap mask
+
+# ---- Optional second model for annotations ----
+# Main text and annotations are often different hands (or print vs.
+# handwriting).  Set this to e.g. TROCR_MODELS["large_handwritten"] while
+# TROCR_MODEL_NAME is a printed model, and annotation lines (tilted lines
+# and orientation-pass finds) are read with it.  None = one model for all.
+ANNOTATION_TROCR_MODEL_NAME: Optional[str] = None
+
+APP_NAME        = "Opticolumn"
+APP_VERSION     = "2026"
+APP_SCRIPT      = Path(__file__).name
+APP_URL         = "https://github.com/Scholarly-Projects/opticolumn"
+APP_AUTHOR      = "Andrew Weymouth"
+APP_INSTITUTION = "University of Idaho"       # the author's affiliation
+APP_LICENSE     = "MIT"
+APP_CREATOR     = f"{APP_NAME} {APP_VERSION} ({APP_URL})"
+APP_CITATION    = f"{APP_AUTHOR}. {APP_NAME} ({APP_VERSION}). {APP_INSTITUTION}. {APP_URL}"
+DOC_SUBJECT     = "OCR processed document"
+DOC_KEYWORDS    = "OCR; archival document; annotations; searchable PDF; Opticolumn; Kraken; TrOCR"
+DOC_LANGUAGE    = "en-US"
+OPT_NAMESPACE   = "https://github.com/Scholarly-Projects/opticolumn/ns/"
+KEEP_SOURCE_TITLE_AUTHOR = True   # keep the input PDF's own Title/Author when it has them
+SEGMENTATION_MODEL = "Kraken blla (blla.mlmodel)"
+ORIENTATION_SUMMARY = (
+    f"page deskew {'max ' + str(MAX_SKEW_DEG) + ' deg' if DESKEW else 'off'}; "
+    f"per-line straightening {'on' if LINE_STRAIGHTEN else 'off'}; "
+    f"orientation passes {', '.join(str(a) for a in ORIENTATION_PASSES) or 'none'}"
+    + (f"; annotation model {ANNOTATION_TROCR_MODEL_NAME}" if ANNOTATION_TROCR_MODEL_NAME else "")
+)
+
+# One id per run: every PDF written by the same invocation shares it.
+RUN_ID = str(uuid.uuid4())
+
+# Set at start-up by _calibrate_morph_sign(): which sign of fitz.Matrix(angle)
+# turns inserted text clockwise (downward-right) in page coordinates.
+MORPH_SIGN = 1
+
+# ---------------- Logging Setup ----------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler()],
+)
+logger = logging.getLogger(__name__)
+
+
+# ── Date helpers ──────────────────────────────────────────────────────────────
+def get_pdf_date_string(dt=None):
+    if dt is None:
+        dt = datetime.datetime.now()
+    return dt.strftime("D:%Y%m%d%H%M%S")
+
+def get_xmp_date_string(dt=None):
+    if dt is None:
+        dt = datetime.datetime.now()
+    return dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+# ---------------- Font and ICC Profile Setup ----------------
+def setup_pdfa_resources():
+    try:
+        font_dir = Path("fonts")
+        font_dir.mkdir(exist_ok=True)
+        font_path = Path(FONT_PATH)
+        if not font_path.exists():
+            logger.info("Downloading FreeSans font for embedding...")
+            import urllib.request
+            urllib.request.urlretrieve(
+                "https://github.com/opensourcedesign/fonts/raw/master/gnu-freefont_freesans/FreeSans.ttf",
+                str(font_path),
+            )
+        srgb_path = Path(SRGB_ICC_PATH)
+        if not srgb_path.exists():
+            logger.info("Downloading sRGB ICC profile...")
+            try:
+                import urllib.request
+                if platform.system() == "Darwin":
+                    system_profile = "/System/Library/ColorSync/Profiles/sRGB Profile.icc"
+                elif platform.system() == "Windows":
+                    system_profile = os.path.join(
+                        os.environ.get("WINDIR", "C:\\Windows"),
+                        "System32", "spool", "drivers", "color",
+                        "sRGB Color Space Profile.icm",
+                    )
+                elif platform.system() == "Linux":
+                    system_profile = "/usr/share/color/icc/sRGB.icc"
+                else:
+                    system_profile = None
+                if system_profile and Path(system_profile).exists():
+                    shutil.copy2(system_profile, str(srgb_path))
+                else:
+                    urllib.request.urlretrieve("https://www.color.org/srgb.xalter", str(srgb_path))
+            except Exception as e:
+                logger.warning(f"Could not obtain sRGB ICC profile: {e}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to setup PDF/A resources: {e}")
+        return False
+
+
+# ---------------- XMP Metadata ----------------
+def _sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+_OPT_PROPERTIES = [
+    ("ToolName",          "Text",    "Name of the tool that produced the OCR text layer"),
+    ("Version",           "Text",    "Version of the tool that produced the OCR text layer"),
+    ("Script",            "Text",    "Script file that produced the OCR text layer"),
+    ("ProjectURL",        "Text",    "Project site of the tool"),
+    ("ToolAuthor",        "Text",    "Author of the tool"),
+    ("ToolAffiliation",   "Text",    "Institutional affiliation of the tool author"),
+    ("ToolLicense",       "Text",    "Licence of the tool"),
+    ("Citation",          "Text",    "Recommended citation for the tool"),
+    ("RunID",             "Text",    "Identifier of the processing run that produced this file"),
+    ("SourceFile",        "Text",    "File name of the source PDF"),
+    ("SourceSHA256",      "Text",    "SHA-256 checksum of the source PDF"),
+    ("RenderDPI",         "Integer", "Resolution at which pages were rendered for OCR"),
+    ("SegmentationModel", "Text",    "Line segmentation model used for OCR"),
+    ("OCRModel",          "Text",    "Text recognition model used for OCR"),
+    ("OrientationHandling", "Text",  "Deskew, line straightening and orientation passes applied before OCR"),
+    ("PagesTotal",        "Integer", "Pages in the document"),
+]
+
+
+def create_xmp_metadata(title, author, subject, keywords, creator, producer,
+                        creation_date, modify_date, language=DOC_LANGUAGE,
+                        opt_values: Optional[Dict[str, str]] = None, source_file: str = "",
+                        doc_id: str = "", instance_id: str = "", event_params: str = ""):
+    """
+    XMP packet for PDF/A-1b.  Standard schemas carry what any repository
+    system reads (title, creator tool, keywords, source, identifiers, a
+    processing-history event); the custom opt: schema carries attribution
+    and run provenance, each property declared in the PDF/A extension
+    schema.  Title/Author/Subject/Keywords/Creator/Producer mirror the
+    document Info dictionary exactly, as PDF/A requires.
+    """
+    try:
+        e = lambda v: xml_escape(str(v))
+        ns = e(OPT_NAMESPACE)
+        values = opt_values or {}
+        creator_xml = (f"\n      <dc:creator><rdf:Seq><rdf:li>{e(author)}</rdf:li></rdf:Seq></dc:creator>"
+                       if author else "")
+        source_xml = f"\n      <dc:source>{e(source_file)}</dc:source>" if source_file else ""
+        opt_xml = "\n".join(f"      <opt:{n}>{e(values[n])}</opt:{n}>"
+                            for n, _t, _d in _OPT_PROPERTIES if values.get(n) not in (None, ""))
+        decl_xml = "\n".join(f"""                <rdf:li rdf:parseType="Resource">
+                  <pdfaProperty:name>{n}</pdfaProperty:name>
+                  <pdfaProperty:valueType>{t}</pdfaProperty:valueType>
+                  <pdfaProperty:category>internal</pdfaProperty:category>
+                  <pdfaProperty:description>{e(d)}</pdfaProperty:description>
+                </rdf:li>""" for n, t, d in _OPT_PROPERTIES)
+        return f"""<?xpacket begin="\ufeff" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+    <rdf:Description rdf:about="" xmlns:pdf="http://ns.adobe.com/pdf/1.3/">
+      <pdf:Producer>{e(producer)}</pdf:Producer>
+      <pdf:Keywords>{e(keywords)}</pdf:Keywords>
+    </rdf:Description>
+    <rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/">
+      <dc:format>application/pdf</dc:format>
+      <dc:title><rdf:Alt><rdf:li xml:lang="x-default">{e(title)}</rdf:li></rdf:Alt></dc:title>{creator_xml}
+      <dc:description><rdf:Alt><rdf:li xml:lang="x-default">{e(subject)}</rdf:li></rdf:Alt></dc:description>
+      <dc:language><rdf:Bag><rdf:li>{e(language)}</rdf:li></rdf:Bag></dc:language>{source_xml}
+    </rdf:Description>
+    <rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+      <xmp:CreatorTool>{e(creator)}</xmp:CreatorTool>
+      <xmp:CreateDate>{creation_date}</xmp:CreateDate>
+      <xmp:ModifyDate>{modify_date}</xmp:ModifyDate>
+      <xmp:MetadataDate>{modify_date}</xmp:MetadataDate>
+    </rdf:Description>
+    <rdf:Description rdf:about=""
+        xmlns:xmpMM="http://ns.adobe.com/xap/1.0/mm/"
+        xmlns:stEvt="http://ns.adobe.com/xap/1.0/sType/ResourceEvent#">
+      <xmpMM:DocumentID>{e(doc_id)}</xmpMM:DocumentID>
+      <xmpMM:InstanceID>{e(instance_id)}</xmpMM:InstanceID>
+      <xmpMM:History>
+        <rdf:Seq>
+          <rdf:li rdf:parseType="Resource">
+            <stEvt:action>converted</stEvt:action>
+            <stEvt:instanceID>{e(instance_id)}</stEvt:instanceID>
+            <stEvt:parameters>{e(event_params)}</stEvt:parameters>
+            <stEvt:softwareAgent>{e(creator)}</stEvt:softwareAgent>
+            <stEvt:when>{modify_date}</stEvt:when>
+          </rdf:li>
+        </rdf:Seq>
+      </xmpMM:History>
+    </rdf:Description>
+    <rdf:Description rdf:about="" xmlns:pdfaid="http://www.aiim.org/pdfa/ns/id/">
+      <pdfaid:part>1</pdfaid:part>
+      <pdfaid:conformance>B</pdfaid:conformance>
+    </rdf:Description>
+    <rdf:Description rdf:about="" xmlns:opt="{ns}">
+{opt_xml}
+    </rdf:Description>
+    <rdf:Description rdf:about=""
+        xmlns:pdfaExtension="http://www.aiim.org/pdfa/ns/extension/"
+        xmlns:pdfaSchema="http://www.aiim.org/pdfa/ns/schema#"
+        xmlns:pdfaProperty="http://www.aiim.org/pdfa/ns/property#">
+      <pdfaExtension:schemas>
+        <rdf:Bag>
+          <rdf:li rdf:parseType="Resource">
+            <pdfaSchema:schema>{e(APP_NAME)} processing and attribution metadata</pdfaSchema:schema>
+            <pdfaSchema:namespaceURI>{ns}</pdfaSchema:namespaceURI>
+            <pdfaSchema:prefix>opt</pdfaSchema:prefix>
+            <pdfaSchema:property>
+              <rdf:Seq>
+{decl_xml}
+              </rdf:Seq>
+            </pdfaSchema:property>
+          </rdf:li>
+        </rdf:Bag>
+      </pdfaExtension:schemas>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>"""
+    except Exception as e:
+        logger.error(f"Failed to create XMP metadata: {e}")
+        return None
+
+
+def stamp_document_metadata(doc: fitz.Document, filename: str, source_path: Optional[str] = None) -> None:
+    """
+    Document Info dictionary + XMP + viewer prefs.
+
+    Title and Author describe the document, not the tool: the source PDF's
+    own Title/Author are kept when present (KEEP_SOURCE_TITLE_AUTHOR),
+    otherwise Title is the file name and Author is left empty.  The tool,
+    its author, the run, the source checksum and the orientation handling
+    are recorded in Creator, Keywords and the XMP opt: properties.
+    """
+    now = datetime.datetime.now()
+    creation_date = get_pdf_date_string(now)
+    xmp_date = get_xmp_date_string(now)
+    producer = "PyMuPDF"
+    src = doc.metadata or {}
+    title = (src.get("title") or "").strip() if KEEP_SOURCE_TITLE_AUTHOR else ""
+    author = (src.get("author") or "").strip() if KEEP_SOURCE_TITLE_AUTHOR else ""
+    title = title or filename
+    doc_id = f"uuid:{uuid.uuid4()}"
+    instance_id = f"uuid:{uuid.uuid4()}"
+
+    sha = ""
+    if source_path:
+        try:
+            sha = _sha256(source_path)
+        except OSError as exc:
+            logger.warning(f"Could not checksum {source_path}: {exc}")
+    opt_values = {
+        "ToolName": APP_NAME, "Version": APP_VERSION, "Script": APP_SCRIPT,
+        "ProjectURL": APP_URL, "ToolAuthor": APP_AUTHOR, "ToolAffiliation": APP_INSTITUTION,
+        "ToolLicense": APP_LICENSE, "Citation": APP_CITATION, "RunID": RUN_ID,
+        "SourceFile": filename, "SourceSHA256": sha,
+        "RenderDPI": str(DPI), "SegmentationModel": SEGMENTATION_MODEL,
+        "OCRModel": TROCR_MODEL_NAME, "OrientationHandling": ORIENTATION_SUMMARY,
+        "PagesTotal": str(len(doc)),
+    }
+    params = (f"{APP_SCRIPT}; DPI {DPI}; {SEGMENTATION_MODEL}; OCR {TROCR_MODEL_NAME}; "
+              f"{ORIENTATION_SUMMARY}; run {RUN_ID}")
+
+    doc.set_metadata({
+        "title":        title,
+        "author":       author,
+        "subject":      DOC_SUBJECT,
+        "keywords":     DOC_KEYWORDS,
+        "creator":      APP_CREATOR,
+        "producer":     producer,
+        "creationDate": creation_date,
+        "modDate":      creation_date,
+    })
+    xmp = create_xmp_metadata(
+        title=title,
+        author=author,
+        subject=DOC_SUBJECT,
+        keywords=DOC_KEYWORDS,
+        creator=APP_CREATOR,
+        producer=producer,
+        creation_date=xmp_date,
+        modify_date=xmp_date,
+        language=DOC_LANGUAGE,
+        opt_values=opt_values,
+        source_file=filename,
+        doc_id=doc_id,
+        instance_id=instance_id,
+        event_params=params,
+    )
+    if xmp:
+        doc.set_xml_metadata(xmp)
+    cat = doc.pdf_catalog()
+    doc.xref_set_key(cat, "ViewerPreferences", "<</DisplayDocTitle true>>")
+    doc.xref_set_key(cat, "Lang", f"({DOC_LANGUAGE})")
+    logger.info(f"Metadata: {APP_CREATOR}, run {RUN_ID}" + (f", source SHA-256 {sha}" if sha else ""))
+
+
+# ---------------- Device and Memory Helpers ----------------
+def _pick_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if USE_MPS and getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def free_device_memory() -> None:
+    """
+    Return freed Python objects and cached accelerator memory between pages
+    and files.  MPS and CUDA keep freed blocks cached otherwise, which is
+    what lets memory creep upward until the process is killed.
+    """
+    gc.collect()
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+    except Exception:
+        pass
+
+
+# ---------------- Model Loading ----------------
+# Models are loaded by main() only after it has confirmed there is work to
+# do, rather than at import time.
+seg_model = None
+processor = None
+trocr_model = None
+ann_processor = None      # set only when ANNOTATION_TROCR_MODEL_NAME is used
+ann_model = None
+
+
+def load_models():
+    try:
+        if not setup_pdfa_resources():
+            logger.warning("PDF/A resources setup incomplete.")
+        seg_model_path = Path(MODELS_DIR) / "blla.mlmodel"
+        logger.info(f"Loading segmentation model: {seg_model_path}")
+        seg_model = TorchVGSLModel.load_model(str(seg_model_path))
+        seg_model.eval()
+        logger.info(f"Loading TrOCR model: {TROCR_MODEL_NAME}")
+        processor   = TrOCRProcessor.from_pretrained(TROCR_MODEL_NAME)
+        trocr_model = VisionEncoderDecoderModel.from_pretrained(TROCR_MODEL_NAME)
+        trocr_model.eval()
+        device = _pick_device()
+        trocr_model.to(device)
+        logger.info(f"Using device: {device}")
+        return seg_model, processor, trocr_model
+    except Exception as e:
+        logger.error(f"Failed to load models: {e}")
+        raise
+
+
+def load_annotation_model():
+    """Second TrOCR model for annotation lines, or (None, None) to share the main one."""
+    name = ANNOTATION_TROCR_MODEL_NAME
+    if not name or name == TROCR_MODEL_NAME:
+        return None, None
+    logger.info(f"Loading annotation TrOCR model: {name}")
+    proc = TrOCRProcessor.from_pretrained(name)
+    model = VisionEncoderDecoderModel.from_pretrained(name)
+    model.eval()
+    model.to(_pick_device())
+    return proc, model
+
+
+def _calibrate_morph_sign() -> int:
+    """
+    Insert a test string turned by fitz.Matrix(+10) on a scratch page and
+    read back where its characters landed.  Returns +1 if a positive angle
+    turns text downward-right in page coordinates (y down), else -1, so
+    rotated text placement does not depend on PyMuPDF's convention.
+    """
+    try:
+        with fitz.open() as scratch:
+            pg = scratch.new_page(width=400, height=400)
+            p = fitz.Point(50, 200)
+            pg.insert_text(p, "MMMMMMMMMM", fontsize=12, fontname=FONT_NAME,
+                           morph=(p, fitz.Matrix(10)))
+            chars = [c for b in pg.get_text("rawdict")["blocks"]
+                     for ln in b.get("lines", []) for s in ln["spans"] for c in s["chars"]]
+            if len(chars) >= 2:
+                return 1 if chars[-1]["origin"][1] > chars[0]["origin"][1] else -1
+    except Exception as e:
+        logger.warning(f"Could not calibrate text rotation ({e}); assuming default.")
+    return 1
+
+
+# ---------------- Image Preprocessing (OCR copy only) ----------------
+def preprocess_for_ocr(pil_image: Image.Image) -> Image.Image:
+    """
+    Return a preprocessed COPY of pil_image suitable for the segmentation
+    model and TrOCR.  The original pil_image is never modified and is NOT
+    stored in the output PDF.
+    """
+    if not ENABLE_PREPROCESSING:
+        return pil_image.copy()
+    try:
+        gray = pil_image.convert("L")
+        gray = ImageOps.autocontrast(gray, cutoff=2)
+        processed = gray.convert("RGB")
+        processed = processed.filter(ImageFilter.SHARPEN)
+        return processed
+    except Exception as e:
+        logger.error(f"Error preprocessing image for OCR: {e}")
+        return pil_image.copy()
+
+
+# ── Render a PDF page to a PIL image (original quality, used for the PDF) ──
+def page_to_pil(page: fitz.Page, dpi: int = DPI) -> Image.Image:
+    """Render *page* at *dpi* and return an RGB PIL Image."""
+    pix = page.get_pixmap(dpi=dpi)
+    return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+
+# ---------------- Orientation geometry ----------------
+WHITE = (255, 255, 255)
+IDENTITY = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0)
+
+
+def _otsu(arr: np.ndarray) -> float:
+    """Otsu threshold of a uint8 array."""
+    hist = np.bincount(arr.ravel(), minlength=256).astype(np.float64)
+    total = hist.sum()
+    if total == 0:
+        return 128.0
+    p = hist / total
+    omega = np.cumsum(p)
+    mu = np.cumsum(p * np.arange(256))
+    denom = omega * (1.0 - omega)
+    denom[denom == 0] = np.nan
+    sigma_b = (mu[-1] * omega - mu) ** 2 / denom
+    if np.all(np.isnan(sigma_b)):
+        return 128.0
+    return float(np.nanargmax(sigma_b))
+
+
+def estimate_skew(gray: Image.Image) -> float:
+    """
+    Projection-profile deskew of the main text.  Returns the angle
+    (degrees, PIL convention: positive = rotate counter-clockwise) that
+    levels the text lines, or 0.0 if no angle is clearly better than none.
+    The central part of the page is measured so scan edges and margin
+    notes don't dominate the profile.
+    """
+    w, h = gray.size
+    region = gray.crop((int(w * 0.08), int(h * 0.05), int(w * 0.92), int(h * 0.95)))
+    scale = max(1.0, region.width / 900.0)
+    small = region.resize((max(1, int(region.width / scale)), max(1, int(region.height / scale))),
+                          Image.BILINEAR)
+    arr = np.asarray(small, dtype=np.uint8)
+    ink = arr < _otsu(arr)
+    if ink.mean() < 0.002 or ink.mean() > 0.5:
+        return 0.0
+    bin_img = Image.fromarray((ink * 255).astype(np.uint8), "L")
+
+    def score(a: float) -> float:
+        rows = np.asarray(bin_img.rotate(a, resample=Image.NEAREST, fillcolor=0),
+                          dtype=np.float32).sum(axis=1)
+        return float(np.sum(np.diff(rows) ** 2))
+
+    coarse = np.arange(-MAX_SKEW_DEG, MAX_SKEW_DEG + 1e-6, 0.5)
+    best = float(coarse[int(np.argmax([score(a) for a in coarse]))])
+    fine = np.arange(best - 0.5, best + 0.5 + 1e-6, 0.05)
+    fine_scores = [score(a) for a in fine]
+    best = float(fine[int(np.argmax(fine_scores))])
+    s0 = score(0.0)
+    if s0 > 0 and (max(fine_scores) - s0) / s0 < SKEW_MIN_GAIN:
+        return 0.0
+    if abs(best) < MIN_SKEW_DEG:
+        return 0.0
+    return round(best, 2)
+
+
+def rotate_with_map(img: Image.Image, angle_deg: float, fill) -> Tuple[Image.Image, Tuple[float, ...]]:
+    """
+    Rotate *img* counter-clockwise by angle_deg (any angle), expanding the
+    canvas so nothing is cut off.  Returns the rotated image and the affine
+    (A, B, C, D, E, F) that maps a point (u, v) in the rotated image back to
+    (A*u + B*v + C, D*u + E*v + F) in *img*.
+    """
+    if not angle_deg % 360:
+        return img, IDENTITY
+    a = math.radians(angle_deg)
+    c, s = math.cos(a), math.sin(a)
+    if abs(c) < 1e-12:
+        c = 0.0
+    if abs(s) < 1e-12:
+        s = 0.0
+    W, H = img.size
+    nW = max(1, int(math.ceil(W * abs(c) + H * abs(s) - 1e-6)))
+    nH = max(1, int(math.ceil(W * abs(s) + H * abs(c) - 1e-6)))
+    A, B, D, E = c, -s, s, c
+    C = W / 2.0 - A * nW / 2.0 - B * nH / 2.0
+    F = H / 2.0 - D * nW / 2.0 - E * nH / 2.0
+    out = img.transform((nW, nH), Image.AFFINE, (A, B, C, D, E, F),
+                        resample=Image.BICUBIC, fillcolor=fill)
+    return out, (A, B, C, D, E, F)
+
+
+@dataclass
+class View:
+    """An OCR image of the page at some rotation, and how to map it back to the render."""
+    name: str
+    angle: float
+    affine: Tuple[float, ...] = IDENTITY
+
+    def to_render(self, u: float, v: float) -> Tuple[float, float]:
+        A, B, C, D, E, F = self.affine
+        return (A * u + B * v + C, D * u + E * v + F)
+
+
+def _norm_angle(a: float) -> float:
+    """Wrap an angle to (-180, 180]."""
+    a = (a + 180.0) % 360.0 - 180.0
+    return 180.0 if a == -180.0 else a
+
+
+def _poly_area(pts: List[Tuple[float, float]]) -> float:
+    if len(pts) < 3:
+        return 0.0
+    x = np.array([p[0] for p in pts]); y = np.array([p[1] for p in pts])
+    return 0.5 * abs(float(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1))))
+
+
+def line_geometry(line) -> Optional[dict]:
+    """
+    Polygon, bounding box, baseline ends (in writing order), length,
+    thickness and angle of one Kraken line, in the coordinates of the
+    image it was segmented on.
+    """
+    raw_b = getattr(line, "boundary", None)
+    boundary = [(float(p[0]), float(p[1])) for p in raw_b] if raw_b is not None else []
+    if len(boundary) >= 3:
+        xs = [p[0] for p in boundary]; ys = [p[1] for p in boundary]
+        bbox = (min(xs), min(ys), max(xs), max(ys))
+    elif hasattr(line, "bbox"):
+        bbox = tuple(float(v) for v in line.bbox)
+        boundary = []
+    else:
+        return None
+    x0, y0, x1, y1 = bbox
+
+    raw_bl = getattr(line, "baseline", None)
+    baseline = [(float(p[0]), float(p[1])) for p in raw_bl] if raw_bl is not None else []
+    if len(baseline) >= 2:
+        start, end = baseline[0], baseline[-1]
+        length = sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(baseline, baseline[1:]))
+    else:
+        start, end = (x0, y1), (x1, y1)
+        length = x1 - x0
+    if length < 1:
+        return None
+
+    poly = boundary or [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+    area = _poly_area(poly)
+    thickness = area / length if area > 0 else (y1 - y0)
+    angle = math.degrees(math.atan2(end[1] - start[1], end[0] - start[0]))
+    return {"boundary": boundary, "poly": poly, "bbox": bbox, "start": start, "end": end,
+            "length": length, "thickness": thickness, "angle": angle}
+
+
+def crop_line(img: Image.Image, boundary: List[Tuple[float, float]],
+              bbox: Tuple[float, float, float, float]) -> Image.Image:
+    """Crop one line, padded, with everything outside its polygon whitened."""
+    x0, y0, x1, y1 = bbox
+    bx0, by0 = max(0, int(x0) - LINE_PAD_PX), max(0, int(y0) - LINE_PAD_PX)
+    bx1 = min(img.width, int(math.ceil(x1)) + LINE_PAD_PX)
+    by1 = min(img.height, int(math.ceil(y1)) + LINE_PAD_PX)
+    crop = img.crop((bx0, by0, bx1, by1))
+    if LINE_POLYGON_MASK and len(boundary) >= 3:
+        mask = Image.new("L", crop.size, 0)
+        ImageDraw.Draw(mask).polygon([(px - bx0, py - by0) for px, py in boundary], fill=255)
+        mask = mask.filter(ImageFilter.MaxFilter(5))      # don't shave ascenders/descenders
+        crop = Image.composite(crop, Image.new("RGB", crop.size, WHITE), mask)
+    return crop
+
+
+def straighten_crop(img: Image.Image, geom: dict) -> Image.Image:
+    """
+    Cut a line out along its polygon and rotate it so its baseline runs
+    left-to-right and level, then trim the blank margin the rotation adds.
+    """
+    crop = crop_line(img, geom["boundary"], geom["bbox"])
+    if LINE_STRAIGHTEN and abs(geom["angle"]) >= LINE_DESKEW_MIN_DEG:
+        crop, _ = rotate_with_map(crop, geom["angle"], WHITE)
+        ink = ImageOps.invert(crop.convert("L")).point(lambda v: 255 if v > 40 else 0)
+        bb = ink.getbbox()
+        if bb:
+            p = LINE_PAD_PX
+            crop = crop.crop((max(0, bb[0] - p), max(0, bb[1] - p),
+                              min(crop.width, bb[2] + p), min(crop.height, bb[3] + p)))
+    return crop
+
+
+class Coverage:
+    """Low-resolution mask of page areas that already hold read text."""
+
+    def __init__(self, width: int, height: int):
+        self.s = COVERAGE_SCALE
+        self.mask = Image.new("L", (width // self.s + 1, height // self.s + 1), 0)
+
+    def _scaled(self, poly):
+        return [(x / self.s, y / self.s) for x, y in poly]
+
+    def add(self, poly) -> None:
+        if len(poly) >= 3:
+            ImageDraw.Draw(self.mask).polygon(self._scaled(poly), fill=255)
+
+    def grow(self, px: int = 3) -> None:
+        self.mask = self.mask.filter(ImageFilter.MaxFilter(px))
+
+    def overlap(self, poly) -> float:
+        """Fraction of *poly* (render pixels) already covered."""
+        if len(poly) < 3:
+            return 1.0
+        m = Image.new("L", self.mask.size, 0)
+        ImageDraw.Draw(m).polygon(self._scaled(poly), fill=255)
+        cand = np.asarray(m) > 0
+        n = int(cand.sum())
+        if n == 0:
+            return 1.0
+        return float((cand & (np.asarray(self.mask) > 0)).sum()) / n
+
+
+# ---------------- Text Recognition with TrOCR ----------------
+def _eos_id(model, processor) -> Optional[int]:
+    gcfg = getattr(model, "generation_config", None)
+    eos = getattr(gcfg, "eos_token_id", None) if gcfg is not None else None
+    if eos is None:
+        eos = processor.tokenizer.eos_token_id
+    if isinstance(eos, (list, tuple)):
+        eos = eos[0] if eos else None
+    return eos
+
+
+def _batch_confidences(out, n: int, eos_id: Optional[int]) -> List[float]:
+    """
+    Same confidence as the single-line version — the mean, over decoding
+    steps, of the highest softmax probability at that step — computed per
+    sample of a batch.  Steps after a sample's own end-of-sequence token
+    (where it is only waiting for the rest of the batch) are excluded, so a
+    line read in a batch scores what it would have scored read alone.
+    """
+    if not out.scores:
+        return [0.0] * n
+    steps = len(out.scores)
+    rows = out.scores[0].shape[0]
+    beams = max(1, rows // n)
+    step_max = torch.stack(
+        [torch.softmax(s.float(), dim=-1).max(dim=-1).values for s in out.scores]
+    ).cpu()
+    seqs = out.sequences[:, 1:].cpu()          # drop the decoder start token
+    confs: List[float] = []
+    for i in range(n):
+        length = steps
+        if eos_id is not None:
+            hits = (seqs[i] == eos_id).nonzero(as_tuple=True)[0]
+            if hits.numel():
+                length = min(steps, int(hits[0]) + 1)
+        if length <= 0:
+            confs.append(0.0)
+            continue
+        vals = step_max[:length, i * beams:(i + 1) * beams].max(dim=1).values
+        confs.append(float(vals.mean()))
+    return confs
+
+
+def _read_trocr_batch(images: List[Image.Image], processor, model) -> List[Tuple[str, float]]:
+    pixel_values = processor(images=images, return_tensors="pt").pixel_values
+    device = next(model.parameters()).device
+    pixel_values = pixel_values.to(device)
+    with torch.inference_mode():
+        out = model.generate(
+            pixel_values, output_scores=True, return_dict_in_generate=True
+        )
+    texts = processor.batch_decode(out.sequences, skip_special_tokens=True)
+    confs = _batch_confidences(out, len(images), _eos_id(model, processor))
+    del out, pixel_values
+    return [(t.strip(), c) for t, c in zip(texts, confs)]
+
+
+def recognize_lines_with_trocr(images: List[Image.Image], processor, model) -> List[Tuple[str, float]]:
+    """
+    Read line crops TROCR_BATCH_SIZE at a time.  A batch that fails on the
+    GPU (typically out of memory) moves the model to the CPU and is retried
+    there; a batch that still fails returns empty reads, which the noise
+    filter drops, instead of ending the run.
+    """
+    results: List[Tuple[str, float]] = []
+    for i in range(0, len(images), TROCR_BATCH_SIZE):
+        batch = images[i:i + TROCR_BATCH_SIZE]
+        try:
+            results.extend(_read_trocr_batch(batch, processor, model))
+            continue
+        except Exception as e:
+            exc = e
+        device = next(model.parameters()).device
+        if device.type != "cpu":
+            logger.warning(f"TrOCR batch failed on {device} ({str(exc)[:120]}); falling back to CPU.")
+            free_device_memory()
+            model.to(torch.device("cpu"))
+            try:
+                results.extend(_read_trocr_batch(batch, processor, model))
+                continue
+            except Exception as e2:
+                exc = e2
+        logger.error(f"Error recognising text with TrOCR: {exc}")
+        results.extend([("", 0.0)] * len(batch))
+    return results
+
+
+def recognize_text_with_trocr(image: Image.Image, processor, model) -> tuple[str, float]:
+    """Single-crop wrapper kept for compatibility."""
+    return recognize_lines_with_trocr([image], processor, model)[0]
+
+
+def read_jobs(jobs: List[dict]) -> None:
+    """
+    Read every job's crop in place (sets text/conf).  Annotation jobs go to
+    the annotation model when one is loaded.  Jobs flagged "flip" are also
+    read upside down; if that reads better, the text is kept and the line's
+    start/end are swapped so it is placed the right way round.
+    """
+    groups: Dict[str, List[dict]] = {}
+    for j in jobs:
+        key = "ann" if (j["kind"] == "annotation" and ann_model is not None) else "main"
+        groups.setdefault(key, []).append(j)
+
+    for key, group in groups.items():
+        proc, model = (ann_processor, ann_model) if key == "ann" else (processor, trocr_model)
+        images: List[Image.Image] = []
+        for j in group:
+            images.append(j["crop"])
+            if j["flip"]:
+                images.append(j["crop"].rotate(180))
+        reads = recognize_lines_with_trocr(images, proc, model)
+        k = 0
+        for j in group:
+            j["text"], j["conf"] = reads[k]; k += 1
+            if j["flip"]:
+                t2, c2 = reads[k]; k += 1
+                if c2 > j["conf"]:
+                    j["text"], j["conf"] = t2, c2
+                    j["start"], j["end"] = j["end"], j["start"]
+                    j["flipped"] = True
+            j.pop("crop", None)
+        del images, reads
+
+
+# ---------------- Noise Detection ----------------
+def is_likely_noise(text: str, confidence: float, seg_h: int, seg_w: int) -> bool:
+    if not text:
+        return True
+    if seg_h < MIN_SEGMENT_HEIGHT or seg_w < 15:
+        return True
+    ar = seg_w / seg_h
+    if ar < 0.1 or ar > 100:
+        return True
+    tc = text.strip()
+    tl = len(tc)
+    if tl == 1:
+        return confidence < SINGLE_CHAR_CONFIDENCE_THRESHOLD
+    if confidence < CONFIDENCE_THRESHOLD:
+        return True
+    if len(set(tc)) == 1 and tl > 2:
+        return True
+    noise_patterns = [r"^[oOlI\.\|]+$", r"^[0-9\.\,]+$", r"^[^a-zA-Z0-9\s]+$"]
+    for pat in noise_patterns:
+        if re.match(pat, tc) and confidence < SINGLE_CHAR_CONFIDENCE_THRESHOLD:
+            return True
+    if tl > 3 and not any(c.lower() in "aeiou" for c in tc) and confidence < 0.7:
+        return True
+    return False
+
+
+# ---------------- Column Detection and Sorting ----------------
+def geometric_column_sort(lines: List) -> List:
+    """
+    Pure-geometry fallback column sorter using a horizontal projection
+    histogram.  Used only when Kraken has not provided reading-order
+    metadata.
+    """
+    if len(lines) <= 1:
+        return lines
+
+    bboxes = []
+    for line in lines:
+        if hasattr(line, "boundary") and len(line.boundary) >= 3:
+            xs = [p[0] for p in line.boundary]
+            ys = [p[1] for p in line.boundary]
+            x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
+        elif hasattr(line, "bbox"):
+            x0, y0, x1, y1 = line.bbox
+        else:
+            continue
+        bboxes.append((x0, y0, x1, y1, line))
+
+    if not bboxes:
+        return lines
+
+    page_width = max(b[2] for b in bboxes)
+    resolution = 10
+    hist_w = int(page_width / resolution) + 1
+    hist   = [0] * hist_w
+    for x0, y0, x1, y1, _ in bboxes:
+        for bi in range(int(x0 / resolution), min(int(x1 / resolution) + 1, hist_w)):
+            hist[bi] += (y1 - y0)
+
+    smoothed = hist.copy()
+    for i in range(1, len(hist) - 1):
+        smoothed[i] = (hist[i - 1] + 2 * hist[i] + hist[i + 1]) / 4
+
+    valleys = []
+    for i in range(1, len(smoothed) - 1):
+        if smoothed[i] < smoothed[i - 1] and smoothed[i] < smoothed[i + 1]:
+            nbr_max = max(smoothed[i - 1], smoothed[i + 1])
+            if nbr_max > 0 and smoothed[i] / nbr_max < 0.3:
+                valleys.append(i * resolution)
+
+    if not valleys:
+        widths = [x1 - x0 for x0, y0, x1, y1, _ in bboxes]
+        avg_w  = sum(widths) / len(widths) if widths else 100
+        n_cols = max(1, min(int(page_width / (avg_w * 1.5)), 5))
+        col_w  = page_width / n_cols
+        valleys = [int((i + 1) * col_w) for i in range(n_cols - 1)]
+
+    valleys  = sorted(v for v in valleys if 0 < v < page_width)
+    columns  = [[] for _ in range(len(valleys) + 1)]
+    for box in bboxes:
+        x0, y0, x1, y1, line = box
+        cx    = (x0 + x1) / 2
+        col_i = sum(1 for v in valleys if cx > v)
+        columns[col_i].append(box)
+
+    sorted_lines = []
+    for col in columns:
+        for box in sorted(col, key=lambda b: b[1]):
+            sorted_lines.append(box[4])
+    return sorted_lines
+
+
+def order_lines(segmentation) -> List:
+    """
+    Kraken blla runs its own reading-order algorithm before returning, so
+    `segmentation.lines` is already in reading order; use it directly.
+    """
+    lines = getattr(segmentation, "lines", [])
+    if not lines:
+        return []
+    logger.debug(f"Using Kraken reading order for {len(lines)} lines.")
+    return list(lines)
+
+
+# ---------------- OCR Text Element Extraction ----------------
+def _make_job(img: Image.Image, view: View, geom: dict, kind: str, flip: bool) -> dict:
+    return {
+        "crop":  straighten_crop(img, geom),
+        "start": view.to_render(*geom["start"]),
+        "end":   view.to_render(*geom["end"]),
+        "poly":  [view.to_render(*p) for p in geom["poly"]],
+        "sh":    geom["thickness"],
+        "sw":    geom["length"],
+        "kind":  kind,
+        "flip":  flip,
+    }
+
+
+def _to_element(job: dict) -> dict:
+    return {
+        "start":     job["start"],
+        "end":       job["end"],
+        "font_size": max(6, min(job["sh"] * 0.9, 72)),
+        "text":      job["text"],
+        "kind":      job["kind"],
+    }
+
+
+def _save_debug(img: Image.Image, filename: str, page_num: int, tag: str) -> None:
+    debug_dir = Path("debug_images")
+    debug_dir.mkdir(exist_ok=True)
+    img.save(debug_dir / f"{filename}_page{page_num}_{tag}.png")
+
+
+def create_page_ocr_elements(
+    pil_image: Image.Image,
+    page_num: int,
+    total_pages: int,
+    filename: str,
+) -> List[dict]:
+    """
+    Run segmentation + TrOCR on ONE page image.  Returns a list of dicts in
+    render-pixel coordinates:
+
+      start, end   baseline ends in writing order (so they carry the line's
+                   angle, whatever it is)
+      font_size    line thickness * 0.9
+      text, kind   "main" or "annotation"
+
+    Main pass: deskew the page, segment it, straighten and read each line
+    (steep lines both ways up).  Orientation passes: segment the page
+    turned by each ORIENTATION_PASSES angle and keep only lines that fall
+    where the main pass found nothing.
+    """
+    logger.info(f"Processing page {page_num}/{total_pages} of {filename}")
+    elements: List[dict] = []
+    W, H = pil_image.size
+
+    try:
+        base = preprocess_for_ocr(pil_image)          # OCR copy, unrotated
+        page_angle = estimate_skew(base.convert("L")) if DESKEW else 0.0
+
+        # ── Main pass ────────────────────────────────────────────────────
+        main_img, aff = rotate_with_map(base, page_angle, WHITE)
+        view = View("main", page_angle, aff)
+        if DEBUG_SAVE_INTERMEDIATE:
+            _save_debug(main_img, filename, page_num, "main")
+        segmentation = blla.segment(main_img, model=seg_model)
+        lines = order_lines(segmentation)
+        del segmentation
+
+        if not lines:
+            logger.warning("No text lines detected in the main pass. Saving debug image...")
+            _save_debug(main_img, filename, page_num, "preprocessed")
+
+        main_jobs: List[dict] = []
+        filtered = 0
+        for i, line in enumerate(lines):
+            try:
+                g = line_geometry(line)
+                if g is None or g["thickness"] < 5 or g["length"] < 5:
+                    filtered += 1
+                    continue
+                a = abs(_norm_angle(g["angle"]))
+                tilt = min(a, 180.0 - a)                   # 0 = level, either way up
+                kind = "annotation" if tilt >= ANNOTATION_ANGLE_DEG else "main"
+                main_jobs.append(_make_job(main_img, view, g, kind, flip=a > FLIP_CHECK_DEG))
+            except Exception as e:
+                logger.error(f"Error on text line {i + 1}: {e}")
+        del lines, main_img
+
+        read_jobs(main_jobs)
+        coverage = Coverage(W, H)
+        tilted = 0
+        for j in main_jobs:
+            if is_likely_noise(j["text"], j["conf"], j["sh"], j["sw"]):
+                filtered += 1
+                continue
+            elements.append(_to_element(j))
+            coverage.add(j["poly"])
+            tilted += j["kind"] == "annotation"
+        # Lines Kraken found but which read as noise still mark the area as
+        # "seen", so a rotated pass does not re-read the same ink sideways.
+        for j in main_jobs:
+            coverage.add(j["poly"])
+        coverage.grow()
+        logger.info(
+            f"Page {page_num}: page deskew {page_angle:+.2f}°, "
+            f"{len(elements)} main-pass lines ({tilted} tilted annotations), {filtered} filtered"
+        )
+        del main_jobs
+        free_device_memory()
+
+        # ── Orientation passes ───────────────────────────────────────────
+        candidates: List[dict] = []
+        for theta in ORIENTATION_PASSES:
+            try:
+                rot_img, aff = rotate_with_map(base, page_angle + theta, WHITE)
+                rview = View(f"rot{theta}", page_angle + theta, aff)
+                if DEBUG_SAVE_INTERMEDIATE:
+                    _save_debug(rot_img, filename, page_num, f"rot{theta}")
+                segmentation = blla.segment(rot_img, model=seg_model)
+                found = 0
+                for line in order_lines(segmentation):
+                    g = line_geometry(line)
+                    if g is None or g["thickness"] < 5 or g["length"] < 5:
+                        continue
+                    poly = [rview.to_render(*p) for p in g["poly"]]
+                    if coverage.overlap(poly) > MAX_OVERLAP:
+                        continue
+                    candidates.append(_make_job(rot_img, rview, g, "annotation", flip=True))
+                    found += 1
+                del segmentation, rot_img
+                logger.info(f"Page {page_num}: {theta}° pass, {found} candidate line(s) outside the main text")
+            except Exception as e:
+                logger.error(f"Orientation pass {theta}° failed on page {page_num}: {e}")
+            free_device_memory()
+
+        if candidates:
+            read_jobs(candidates)
+            accepted: List[dict] = []
+            # Best reads first, so where two passes found the same note the
+            # clearer reading wins and the other is rejected as overlap.
+            for j in sorted(candidates, key=lambda c: c["conf"], reverse=True):
+                if j["conf"] < ROTATED_MIN_CONFIDENCE:
+                    continue
+                if is_likely_noise(j["text"], j["conf"], j["sh"], j["sw"]):
+                    continue
+                if coverage.overlap(j["poly"]) > MAX_OVERLAP:
+                    continue
+                coverage.add(j["poly"])
+                accepted.append(j)
+            accepted.sort(key=lambda j: (min(p[1] for p in j["poly"]), min(p[0] for p in j["poly"])))
+            elements.extend(_to_element(j) for j in accepted)
+            logger.info(f"Page {page_num}: {len(accepted)} rotated margin note(s) kept "
+                        f"of {len(candidates)} candidate(s)")
+        del base
+
+    except Exception as e:
+        logger.error(f"OCR failed for page {page_num}: {e}")
+
+    return elements
+
+
+def create_ocr_text_elements(
+    pil_images: List[Image.Image],
+    filename: str,
+) -> List[List[dict]]:
+    """
+    Compatibility wrapper: OCR a list of already-rendered pages.  The main
+    pipeline no longer uses it (it renders and OCRs one page at a time).
+    """
+    font_path = Path(FONT_PATH)
+    if not font_path.exists():
+        raise FileNotFoundError(f"Required font {font_path} is missing.")
+
+    all_pages: List[List[dict]] = []
+    for idx, pil_image in enumerate(pil_images):
+        all_pages.append(create_page_ocr_elements(pil_image, idx + 1, len(pil_images), filename))
+        free_device_memory()
+    total_elements = sum(len(p) for p in all_pages)
+    logger.info(
+        f"OCR extraction complete: {total_elements} total text elements "
+        f"across {len(pil_images)} pages"
+    )
+    return all_pages
+
+
+# ---------------- PDF/A Compliance ----------------
+def setup_pdfa_compliance(pdf_path: str):
+    """Embed sRGB OutputIntent into an already-saved PDF using pikepdf."""
+    try:
+        srgb_path = Path(SRGB_ICC_PATH)
+        if not srgb_path.exists():
+            logger.error("sRGB ICC profile not found; skipping PDF/A OutputIntent.")
+            return
+        with pikepdf.open(pdf_path, allow_overwriting_input=True) as pdf:
+            if "/OutputIntents" not in pdf.Root:
+                pdf.Root["/OutputIntents"] = pikepdf.Array()
+
+            icc_data = srgb_path.read_bytes()
+            icc_stream = pdf.make_stream(icc_data)
+            icc_stream.stream_dict["/N"]         = pikepdf.Integer(3)
+            icc_stream.stream_dict["/Alternate"] = pikepdf.Name("/DeviceRGB")
+
+            output_intent = pikepdf.Dictionary({
+                "/Type":                     pikepdf.Name("/OutputIntent"),
+                "/S":                        pikepdf.Name("/GTS_PDFA1"),
+                "/Info":                     pikepdf.String("sRGB IEC61966-2.1"),
+                "/OutputConditionIdentifier": pikepdf.String("sRGB"),
+                "/DestOutputProfile":         pdf.make_indirect(icc_stream),
+            })
+            pdf.Root["/OutputIntents"].append(pdf.make_indirect(output_intent))
+            pdf.save(pdf_path)
+        logger.info("PDF/A OutputIntent embedded successfully.")
+    except Exception as e:
+        logger.error(f"Failed to set up PDF/A compliance: {e}")
+
+
+# ---------------- PDF Processing (OCR) ----------------
+def insert_line_text(page: fitz.Page, elem: dict, sx: float, sy: float) -> None:
+    """
+    Write one line's invisible text along that line's own direction on the
+    page: level for main text, tilted or vertical for annotations.
+    """
+    p0 = fitz.Point(elem["start"][0] * sx, elem["start"][1] * sy)
+    p1 = fitz.Point(elem["end"][0] * sx, elem["end"][1] * sy)
+    dx, dy = p1.x - p0.x, p1.y - p0.y
+    length = math.hypot(dx, dy)
+    angle = math.degrees(math.atan2(dy, dx))          # page coords, y down
+    fontsize = max(4, elem["font_size"] * min(sx, sy))
+
+    # Fit the string to the line's own length, and keep a level line
+    # inside the page's right edge.
+    if abs(dy) < 1e-6 and dx > 0 and p1.x > page.rect.width:
+        length = max(0.0, page.rect.width - p0.x)
+    if length > 0:
+        text_w = fitz.get_text_length(elem["text"], fontname=FONT_NAME, fontsize=fontsize)
+        if text_w > length:
+            fontsize = max(4, fontsize * length / text_w)
+
+    kwargs = {}
+    if abs(angle) >= 0.05:
+        kwargs["morph"] = (p0, fitz.Matrix(MORPH_SIGN * angle))
+    page.insert_text(
+        p0,
+        elem["text"],
+        fontsize=fontsize,
+        fontname=FONT_NAME,
+        render_mode=3,
+        color=(0, 0, 0),
+        **kwargs,
+    )
+
+
+def process_single_pdf_ocr(input_path: str, output_path: str) -> bool:
+    """
+    Add an invisible OCR text layer to *input_path* and write the result to
+    *output_path*, one page at a time.  Original image streams are never
+    re-encoded; only invisible text is added.
+    """
+    filename = os.path.basename(input_path)
+    logger.info(f"Starting OCR for: {filename}")
+
+    try:
+        font_path = Path(FONT_PATH)
+        if not font_path.exists():
+            raise FileNotFoundError(f"Required font {font_path} is missing.")
+
+        with fitz.open(input_path) as doc:
+            n_pages = len(doc)
+            stamp_document_metadata(doc, filename, input_path)
+
+            logger.info(f"Rendering {n_pages} pages at {DPI} DPI for OCR, one page at a time…")
+            total_elements = 0
+            total_notes = 0
+
+            for page_num in range(n_pages):
+                page = doc[page_num]
+
+                pil_img = page_to_pil(page, dpi=DPI)
+                img_w, img_h = pil_img.size
+                elements = create_page_ocr_elements(pil_img, page_num + 1, n_pages, filename)
+                del pil_img
+                free_device_memory()
+                total_elements += len(elements)
+                total_notes += sum(1 for e in elements if e["kind"] == "annotation")
+
+                # ── Strip any pre-existing text layer ────────────────────────
+                # Scans that were previously OCR'd would otherwise produce a
+                # doubled text layer.  Image streams and line art are left
+                # untouched; only content-stream text operators are removed.
+                existing_text = page.get_text().strip()
+                if existing_text:
+                    logger.info(
+                        f"Page {page_num+1}: removing existing text layer "
+                        f"({len(existing_text)} chars) before inserting OCR."
+                    )
+                    page.add_redact_annot(page.rect)
+                    redact_kwargs = {"images": fitz.PDF_REDACT_IMAGE_NONE}
+                    if hasattr(fitz, "PDF_REDACT_LINE_ART_NONE"):
+                        redact_kwargs["graphics"] = fitz.PDF_REDACT_LINE_ART_NONE
+                    page.apply_redactions(**redact_kwargs)
+
+                sx = page.rect.width / img_w
+                sy = page.rect.height / img_h
+
+                inserted = 0
+                for elem in elements:
+                    try:
+                        insert_line_text(page, elem, sx, sy)
+                        inserted += 1
+                    except Exception as e:
+                        logger.error(f"Failed to insert text on page {page_num+1}: {e}")
+
+                logger.info(f"Page {page_num+1}: inserted {inserted}/{len(elements)} text elements")
+                del elements
+
+            logger.info(
+                f"OCR extraction complete: {total_elements} total text elements "
+                f"({total_notes} annotations) across {n_pages} pages"
+            )
+
+            doc.save(
+                output_path,
+                deflate=True,          # compress streams (text, metadata, etc.)
+                garbage=4,             # remove unused objects
+                clean=True,
+                deflate_images=False,  # leave original image streams untouched
+                encryption=fitz.PDF_ENCRYPT_KEEP,
+            )
+            logger.info(f"OCR-enhanced PDF saved: {output_path}")
+
+        srgb_path = Path(SRGB_ICC_PATH)
+        if srgb_path.exists():
+            logger.info("Applying PDF/A OutputIntent…")
+            setup_pdfa_compliance(output_path)
+        else:
+            logger.warning("sRGB ICC profile not found; PDF/A OutputIntent skipped.")
+
+        logger.info("Verifying OCR layer in final output…")
+        try:
+            with fitz.open(output_path) as final_pdf:
+                total_chars = 0
+                for i, pg in enumerate(final_pdf):
+                    chars = len(pg.get_text().strip())
+                    total_chars += chars
+                    logger.info(f"Final PDF page {i+1} extractable text length: {chars}")
+                if total_chars > 0:
+                    logger.info(f"SUCCESS: Final PDF contains {total_chars} characters of searchable text")
+                else:
+                    logger.error("PROBLEM: Final PDF has no extractable text!")
+        except Exception as e:
+            logger.error(f"Failed to verify final output: {e}")
+
+        return True
+
+    except Exception as e:
+        logger.error(f"OCR processing failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+    finally:
+        free_device_memory()
+
+
+# ---------------- Compression (Size Targeting) ----------------
+def compress_to_target_size(input_pdf: Path, output_pdf: Path, original_size: int) -> Path:
+    """
+    Try to keep the output within 15% of the original size using
+    PDF-native deflate compression only.  No JPEG recompression is
+    attempted — that causes generation loss and is incompatible with
+    archival quality requirements.
+    """
+    max_target = int(original_size * 1.15)
+    logger.info(
+        f"Targeting maximum size: {max_target // 1024} KB "
+        f"(15% increase from original {original_size // 1024} KB)"
+    )
+
+    current_size = input_pdf.stat().st_size
+    logger.info(f"OCR file size before compression: {current_size // 1024} KB")
+
+    if current_size <= max_target:
+        shutil.copy2(input_pdf, output_pdf)
+        logger.info("File already within target size. No additional compression needed.")
+        return output_pdf
+
+    compression_options = [
+        {"deflate": True, "garbage": 4, "clean": True, "deflate_images": False},
+        {"deflate": True, "garbage": 3, "clean": True, "deflate_images": False},
+        {"deflate": True, "garbage": 2, "clean": True, "deflate_images": False},
+    ]
+
+    for i, opts in enumerate(compression_options):
+        temp_out = output_pdf.with_suffix(f".temp_{i}.pdf")
+        try:
+            with fitz.open(str(input_pdf)) as doc:
+                doc.save(str(temp_out), **opts, encryption=fitz.PDF_ENCRYPT_KEEP)
+
+            compressed_size = temp_out.stat().st_size
+            pct = (compressed_size - original_size) / original_size * 100
+            logger.info(f"Compression option {i+1}: {compressed_size // 1024} KB ({pct:+.1f}% from original)")
+
+            if compressed_size <= max_target:
+                try:
+                    with fitz.open(str(temp_out)) as chk:
+                        total_chars = sum(len(pg.get_text().strip()) for pg in chk)
+                except Exception:
+                    total_chars = -1
+
+                if total_chars > 0:
+                    shutil.move(str(temp_out), str(output_pdf))
+                    logger.info(f"Compression option {i+1} accepted; OCR preserved ({total_chars} chars).")
+                    return output_pdf
+                else:
+                    logger.error("OCR lost after compression attempt — falling back to uncompressed OCR file.")
+                    temp_out.unlink(missing_ok=True)
+                    shutil.copy2(input_pdf, output_pdf)
+                    return output_pdf
+            else:
+                temp_out.unlink(missing_ok=True)
+
+        except Exception as e:
+            logger.error(f"Compression option {i+1} failed: {e}")
+            temp_out.unlink(missing_ok=True)
+
+    logger.warning(
+        "All deflate options exceeded the 15% size budget. "
+        "Returning OCR file as-is (images untouched, quality preserved). "
+        "Consider reducing DPI or using a lighter segmentation model if "
+        "strict size limits are mandatory."
+    )
+    shutil.copy2(input_pdf, output_pdf)
+    return output_pdf
+
+
+# ---------------- Main ----------------
+def main():
+    global seg_model, processor, trocr_model, ann_processor, ann_model, MORPH_SIGN
+
+    logger.info(f"{APP_NAME} {APP_VERSION} ({APP_SCRIPT}) by {APP_AUTHOR}, {APP_INSTITUTION} — "
+                f"{APP_LICENSE} licence — {APP_URL}")
+    logger.info(f"Run {RUN_ID}")
+    logger.info(f"Orientation: {ORIENTATION_SUMMARY}")
+    input_folder  = Path(INPUT_DIR)
+    output_folder = Path(OUTPUT_DIR)
+
+    if not input_folder.exists():
+        logger.error(f"Input folder '{INPUT_DIR}' not found.")
+        sys.exit(1)
+    output_folder.mkdir(exist_ok=True)
+
+    pdf_files = sorted(input_folder.glob("*.pdf"))
+    if not pdf_files:
+        logger.error(f"No PDF files in '{INPUT_DIR}'")
+        sys.exit(1)
+
+    # Identify already-processed files and skip them — before any model loads
+    skipped = []
+    pending = []
+    summary = []
+    for pdf_path in pdf_files:
+        final_path = output_folder / f"{pdf_path.stem}.pdf"
+        if SKIP_EXISTING_OUTPUT and final_path.exists():
+            skipped.append(pdf_path.name)
+            summary.append((pdf_path.name, "SKIPPED", final_path.stat().st_size))
+        else:
+            pending.append(pdf_path)
+
+    if skipped:
+        logger.info(f"Skipping {len(skipped)} already-processed file(s): {', '.join(skipped)}")
+
+    if not pending:
+        logger.info("All files have already been processed. Nothing to do.")
+        return
+
+    # Load models once, only now that there is work to do
+    try:
+        seg_model, processor, trocr_model = load_models()
+        ann_processor, ann_model = load_annotation_model()
+    except Exception:
+        logger.error("Model loading failed. Exiting.")
+        sys.exit(1)
+
+    MORPH_SIGN = _calibrate_morph_sign()
+    logger.debug(f"Text rotation sign: {MORPH_SIGN:+d}")
+
+    logger.info(f"Processing {len(pending)} file(s) with TrOCR: {TROCR_MODEL_NAME}")
+    logger.info("Target: Final size ≤ original + 15% (OCR text layer only; images untouched)")
+
+    for pdf_path in pending:
+        original_size = pdf_path.stat().st_size
+        logger.info(f"\n{'=' * 60}")
+        logger.info(f"Processing {pdf_path.name} | Original: {original_size // 1024} KB")
+
+        ocr_temp_path = output_folder / f"{pdf_path.stem}_ocr_temp.pdf"
+
+        if not process_single_pdf_ocr(str(pdf_path), str(ocr_temp_path)):
+            logger.error(f"Skipping {pdf_path.name} due to OCR failure.")
+            summary.append((pdf_path.name, "FAILED", 0))
+            ocr_temp_path.unlink(missing_ok=True)
+            free_device_memory()
+            continue
+
+        final_path  = output_folder / f"{pdf_path.stem}.pdf"
+        result_path = compress_to_target_size(ocr_temp_path, final_path, original_size)
+
+        if result_path.exists():
+            final_size    = result_path.stat().st_size
+            size_increase = (final_size - original_size) / original_size * 100
+            logger.info(
+                f"SUCCESS: {result_path.name} | {final_size // 1024} KB "
+                f"({size_increase:+.1f}% increase from original)"
+            )
+            summary.append((pdf_path.name, "OK", final_size))
+        else:
+            logger.error(f"Failed to generate final output for {pdf_path.name}")
+            summary.append((pdf_path.name, "FAILED", 0))
+
+        try:
+            ocr_temp_path.unlink()
+        except Exception as e:
+            logger.warning(f"Could not delete temp file: {e}")
+
+        free_device_memory()
+
+    logger.info(f"\n{'=' * 60}\nSUMMARY\n{'=' * 60}")
+    for name, status, sz in summary:
+        logger.info(f"  {status:<8}  {name}  ({sz // 1024} KB)")
+    logger.info(f"\nAll done! Output files in '{OUTPUT_DIR}/'")
+
+
+if __name__ == "__main__":
+    main()
