@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Opticolumn 
+Opticolumn
 """
 
 import sys
 import os
+import gc
 import tempfile
 from pathlib import Path
 import fitz  
@@ -50,10 +51,10 @@ DEBUG_OCR_LAYER         = False
 DEBUG_TEXT_POSITIONS    = False
 DEBUG_SAVE_INTERMEDIATE = False
 
-# ---- Branding / attribution / document metadata ----
-# Written into every output PDF (document properties + XMP) so a derivative
-# can always be traced to the tool, its author, the run that produced it and
-# the exact source file.
+SKIP_EXISTING_OUTPUT = True  # skip a PDF whose output already exists (checked before models load)
+TROCR_BATCH_SIZE     = 8     # line crops per TrOCR generate() call; lower it if memory is tight
+USE_MPS              = True  # Apple-silicon GPU if available (falls back to CPU on error)
+
 APP_NAME        = "Opticolumn"
 APP_VERSION     = "2026"
 APP_SCRIPT      = Path(__file__).name
@@ -331,7 +332,39 @@ def stamp_document_metadata(doc: fitz.Document, filename: str, source_path: Opti
     logger.info(f"Metadata: {APP_CREATOR}, run {RUN_ID}" + (f", source SHA-256 {sha}" if sha else ""))
 
 
+# ---------------- Device and Memory Helpers ----------------
+def _pick_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if USE_MPS and getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def free_device_memory() -> None:
+    """
+    Return freed Python objects and cached accelerator memory between pages
+    and files.  MPS and CUDA keep freed blocks cached otherwise, which is
+    what lets memory creep upward until the process is killed.
+    """
+    gc.collect()
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+    except Exception:
+        pass
+
+
 # ---------------- Model Loading ----------------
+# Models are loaded by main() only after it has confirmed there is work to
+# do, rather than at import time.
+seg_model = None
+processor = None
+trocr_model = None
+
+
 def load_models():
     try:
         if not setup_pdfa_resources():
@@ -343,19 +376,14 @@ def load_models():
         logger.info(f"Loading TrOCR model: {TROCR_MODEL_NAME}")
         processor   = TrOCRProcessor.from_pretrained(TROCR_MODEL_NAME)
         trocr_model = VisionEncoderDecoderModel.from_pretrained(TROCR_MODEL_NAME)
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        trocr_model.eval()
+        device = _pick_device()
         trocr_model.to(device)
         logger.info(f"Using device: {device}")
         return seg_model, processor, trocr_model
     except Exception as e:
         logger.error(f"Failed to load models: {e}")
         raise
-
-try:
-    seg_model, processor, trocr_model = load_models()
-except Exception as e:
-    logger.error("Model loading failed. Exiting.")
-    sys.exit(1)
 
 
 # ---------------- Image Preprocessing (OCR copy only) ----------------
@@ -386,28 +414,96 @@ def page_to_pil(page: fitz.Page, dpi: int = DPI) -> Image.Image:
 
 
 # ---------------- Text Recognition with TrOCR ----------------
-def recognize_text_with_trocr(image: Image.Image, processor, model) -> tuple[str, float]:
-    try:
-        pixel_values = processor(image, return_tensors="pt").pixel_values
+def _eos_id(model, processor) -> Optional[int]:
+    gcfg = getattr(model, "generation_config", None)
+    eos = getattr(gcfg, "eos_token_id", None) if gcfg is not None else None
+    if eos is None:
+        eos = processor.tokenizer.eos_token_id
+    if isinstance(eos, (list, tuple)):
+        eos = eos[0] if eos else None
+    return eos
+
+
+def _batch_confidences(out, n: int, eos_id: Optional[int]) -> List[float]:
+    """
+    Same confidence as the single-line version — the mean, over decoding
+    steps, of the highest softmax probability at that step — computed per
+    sample of a batch.  Steps after a sample's own end-of-sequence token
+    (where it is only waiting for the rest of the batch) are excluded, so a
+    line read in a batch scores what it would have scored read alone.
+    """
+    if not out.scores:
+        return [0.0] * n
+    steps = len(out.scores)
+    rows = out.scores[0].shape[0]
+    beams = max(1, rows // n)
+    # (steps, rows): best probability per row at each step
+    step_max = torch.stack(
+        [torch.softmax(s.float(), dim=-1).max(dim=-1).values for s in out.scores]
+    ).cpu()
+    seqs = out.sequences[:, 1:].cpu()          # drop the decoder start token
+    confs: List[float] = []
+    for i in range(n):
+        length = steps
+        if eos_id is not None:
+            hits = (seqs[i] == eos_id).nonzero(as_tuple=True)[0]
+            if hits.numel():
+                length = min(steps, int(hits[0]) + 1)
+        if length <= 0:
+            confs.append(0.0)
+            continue
+        vals = step_max[:length, i * beams:(i + 1) * beams].max(dim=1).values
+        confs.append(float(vals.mean()))
+    return confs
+
+
+def _read_trocr_batch(images: List[Image.Image], processor, model) -> List[Tuple[str, float]]:
+    pixel_values = processor(images=images, return_tensors="pt").pixel_values
+    device = next(model.parameters()).device
+    pixel_values = pixel_values.to(device)
+    with torch.inference_mode():
+        out = model.generate(
+            pixel_values, output_scores=True, return_dict_in_generate=True
+        )
+    texts = processor.batch_decode(out.sequences, skip_special_tokens=True)
+    confs = _batch_confidences(out, len(images), _eos_id(model, processor))
+    del out, pixel_values
+    return [(t.strip(), c) for t, c in zip(texts, confs)]
+
+
+def recognize_lines_with_trocr(images: List[Image.Image], processor, model) -> List[Tuple[str, float]]:
+    """
+    Read line crops TROCR_BATCH_SIZE at a time.  A batch that fails on the
+    GPU (typically out of memory) moves the model to the CPU and is retried
+    there; a batch that still fails returns empty reads, which the noise
+    filter drops, instead of ending the run.
+    """
+    results: List[Tuple[str, float]] = []
+    for i in range(0, len(images), TROCR_BATCH_SIZE):
+        batch = images[i:i + TROCR_BATCH_SIZE]
+        try:
+            results.extend(_read_trocr_batch(batch, processor, model))
+            continue
+        except Exception as e:
+            exc = e
         device = next(model.parameters()).device
-        pixel_values = pixel_values.to(device)
-        with torch.no_grad():
-            out = model.generate(
-                pixel_values, output_scores=True, return_dict_in_generate=True
-            )
-            generated_text = processor.batch_decode(
-                out.sequences, skip_special_tokens=True
-            )[0]
-            if out.scores:
-                probs     = [torch.softmax(s, dim=-1) for s in out.scores]
-                max_probs = [torch.max(p).item() for p in probs]
-                confidence = sum(max_probs) / len(max_probs)
-            else:
-                confidence = 0.0
-        return generated_text.strip(), confidence
-    except Exception as e:
-        logger.error(f"Error recognising text with TrOCR: {e}")
-        return "", 0.0
+        if device.type != "cpu":
+            logger.warning(f"TrOCR batch failed on {device} ({str(exc)[:120]}); falling back to CPU.")
+            free_device_memory()
+            model.to(torch.device("cpu"))
+            try:
+                results.extend(_read_trocr_batch(batch, processor, model))
+                continue
+            except Exception as e2:
+                exc = e2
+        logger.error(f"Error recognising text with TrOCR: {exc}")
+        results.extend([("", 0.0)] * len(batch))
+    return results
+
+
+def recognize_text_with_trocr(image: Image.Image, processor, model) -> tuple[str, float]:
+    """Single-crop wrapper kept for compatibility."""
+    return recognize_lines_with_trocr([image], processor, model)[0]
 
 
 # ---------------- Noise Detection ----------------
@@ -530,92 +626,112 @@ def order_lines(segmentation) -> List:
 
 
 # ---------------- OCR Text Element Extraction ----------------
-def create_ocr_text_elements(
-    pil_images: List[Image.Image],
+def create_page_ocr_elements(
+    pil_image: Image.Image,
+    page_num: int,
+    total_pages: int,
     filename: str,
-) -> List[List[dict]]:
+) -> List[dict]:
     """
-    Run segmentation + TrOCR on each PIL image (which may be a preprocessed
-    copy).  Returns per-page lists of dicts with pixel-space coordinates.
+    Run segmentation + TrOCR on ONE page image.  Returns a list of dicts
+    with pixel-space coordinates.
 
     Keys: x0, x1, y_baseline, font_size, text
     x1 is stored so the insertion step can clamp text width to the segment
     boundary, preventing OCR text from bleeding past the right edge of the
     page.
+
+    Line crops are collected first and read in batches; the noise filter
+    and output order are the same as reading them one at a time.
+    """
+    logger.info(f"Processing page {page_num}/{total_pages} of {filename}")
+    page_elements: List[dict] = []
+    filtered = 0
+
+    try:
+        ocr_image  = preprocess_for_ocr(pil_image)   # OCR copy — preprocessed
+        # pil_image is the original render; ocr_image is used only here
+        segmentation = blla.segment(ocr_image, model=seg_model)
+        logger.info(f"Found {len(segmentation.lines)} text lines on page {page_num}")
+
+        if not segmentation.lines:
+            logger.warning("No text lines detected. Saving debug image...")
+            debug_dir = Path("debug_images")
+            debug_dir.mkdir(exist_ok=True)
+            ocr_image.save(debug_dir / f"{filename}_page{page_num}_preprocessed.png")
+
+        sorted_lines = order_lines(segmentation)
+        del segmentation
+        logger.info(f"Sorted {len(sorted_lines)} lines into reading order.")
+
+        # ── Collect line crops (geometry checks only) ────────────────────
+        jobs = []   # (x0, x1, y1, sh, sw)
+        crops: List[Image.Image] = []
+        for i, line in enumerate(sorted_lines):
+            try:
+                if hasattr(line, "boundary") and len(line.boundary) >= 3:
+                    xs = [p[0] for p in line.boundary]
+                    ys = [p[1] for p in line.boundary]
+                    x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
+                elif hasattr(line, "bbox"):
+                    x0, y0, x1, y1 = line.bbox
+                else:
+                    continue
+
+                sh, sw = y1 - y0, x1 - x0
+                if sh < 5 or sw < 5:
+                    filtered += 1
+                    continue
+
+                # Crop from the OCR copy (same pixel space)
+                crops.append(ocr_image.crop((x0, y0, x1, y1)))
+                jobs.append((x0, x1, y1, sh, sw))
+            except Exception as e:
+                logger.error(f"Error on text line {i + 1}: {e}")
+        del sorted_lines, ocr_image
+
+        # ── Batched recognition ──────────────────────────────────────────
+        reads = recognize_lines_with_trocr(crops, processor, trocr_model)
+        del crops
+
+        for (x0, x1, y1, sh, sw), (text, confidence) in zip(jobs, reads):
+            if is_likely_noise(text, confidence, sh, sw):
+                filtered += 1
+                continue
+
+            page_elements.append({
+                "x0":         x0,
+                "x1":         x1,   # segment right edge (pixel space)
+                "y_baseline": y1,
+                "font_size":  max(6, min(sh * 0.9, 72)),
+                "text":       text,
+            })
+
+        logger.info(f"Page {page_num}: {len(page_elements)} elements, {filtered} filtered.")
+
+    except Exception as e:
+        logger.error(f"OCR failed for page {page_num}: {e}")
+
+    return page_elements
+
+
+def create_ocr_text_elements(
+    pil_images: List[Image.Image],
+    filename: str,
+) -> List[List[dict]]:
+    """
+    Compatibility wrapper: OCR a list of already-rendered pages.  The main
+    pipeline no longer uses it (it renders and OCRs one page at a time).
     """
     font_path = Path(FONT_PATH)
     if not font_path.exists():
         raise FileNotFoundError(f"Required font {font_path} is missing.")
 
     all_pages: List[List[dict]] = []
-    total_elements = 0
-
     for idx, pil_image in enumerate(pil_images):
-        page_num = idx + 1
-        logger.info(f"Processing page {page_num}/{len(pil_images)} of {filename}")
-        page_elements: List[dict] = []
-        filtered = 0
-
-        try:
-            ocr_image  = preprocess_for_ocr(pil_image)   # OCR copy — preprocessed
-            # pil_image is the original render; ocr_image is used only here
-            segmentation = blla.segment(ocr_image, model=seg_model)
-            logger.info(f"Found {len(segmentation.lines)} text lines on page {page_num}")
-
-            if not segmentation.lines:
-                logger.warning("No text lines detected. Saving debug image...")
-                debug_dir = Path("debug_images")
-                debug_dir.mkdir(exist_ok=True)
-                ocr_image.save(debug_dir / f"{filename}_page{page_num}_preprocessed.png")
-
-            sorted_lines = order_lines(segmentation)
-            logger.info(f"Sorted {len(sorted_lines)} lines into reading order.")
-
-            for i, line in enumerate(sorted_lines):
-                try:
-                    if hasattr(line, "boundary") and len(line.boundary) >= 3:
-                        xs = [p[0] for p in line.boundary]
-                        ys = [p[1] for p in line.boundary]
-                        x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
-                    elif hasattr(line, "bbox"):
-                        x0, y0, x1, y1 = line.bbox
-                    else:
-                        continue
-
-                    sh, sw = y1 - y0, x1 - x0
-                    if sh < 5 or sw < 5:
-                        filtered += 1
-                        continue
-
-                    # Crop from the OCR copy (same pixel space)
-                    line_img = ocr_image.crop((x0, y0, x1, y1))
-                    text, confidence = recognize_text_with_trocr(
-                        line_img, processor, trocr_model
-                    )
-
-                    if is_likely_noise(text, confidence, sh, sw):
-                        filtered += 1
-                        continue
-
-                    page_elements.append({
-                        "x0":         x0,
-                        "x1":         x1,   # segment right edge (pixel space)
-                        "y_baseline": y1,
-                        "font_size":  max(6, min(sh * 0.9, 72)),
-                        "text":       text,
-                    })
-
-                except Exception as e:
-                    logger.error(f"Error on text line {i + 1}: {e}")
-
-            logger.info(f"Page {page_num}: {len(page_elements)} elements, {filtered} filtered.")
-            total_elements += len(page_elements)
-
-        except Exception as e:
-            logger.error(f"OCR failed for page {page_num}: {e}")
-
-        all_pages.append(page_elements)
-
+        all_pages.append(create_page_ocr_elements(pil_image, idx + 1, len(pil_images), filename))
+        free_device_memory()
+    total_elements = sum(len(p) for p in all_pages)
     logger.info(
         f"OCR extraction complete: {total_elements} total text elements "
         f"across {len(pil_images)} pages"
@@ -663,41 +779,45 @@ def process_single_pdf_ocr(input_path: str, output_path: str) -> bool:
     Add an invisible OCR text layer to *input_path* and write the result to
     *output_path*.
 
-    Approach (no flatten step):
+    Approach (no flatten step), one page at a time:
       1. Open the ORIGINAL PDF with fitz.
-      2. Render each page to a PIL image (in memory) for OCR only.
-      3. Run segmentation + TrOCR on a preprocessed copy of each render.
-      4. Insert invisible text elements directly into the original page.
-      5. Save once with deflate compression.
+      2. For each page: render it to a PIL image (in memory) for OCR only,
+         run segmentation + TrOCR on a preprocessed copy, insert the
+         invisible text into the original page, then release the render
+         and the accelerator cache before the next page.
+      3. Save once with deflate compression.
 
-    Because the original image streams are never re-encoded, the output file
-    is typically only 3-8% larger than the input.
+    Only one page render is ever held in memory, so long PDFs no longer
+    exhaust RAM.  Because the original image streams are never re-encoded,
+    the output file is typically only 3-8% larger than the input.
     """
     filename = os.path.basename(input_path)
     logger.info(f"Starting OCR for: {filename}")
 
     try:
-        with fitz.open(input_path) as doc:
-            # ── Render all pages to PIL images for OCR ──────────────────────
-            logger.info(f"Rendering {len(doc)} pages at {DPI} DPI for OCR…")
-            pil_images: List[Image.Image] = []
-            for page in doc:
-                pil_images.append(page_to_pil(page, dpi=DPI))
+        font_path = Path(FONT_PATH)
+        if not font_path.exists():
+            raise FileNotFoundError(f"Required font {font_path} is missing.")
 
-            # ── Run OCR on rendered images ───────────────────────────────────
-            ocr_pages = create_ocr_text_elements(pil_images, filename)
+        with fitz.open(input_path) as doc:
+            n_pages = len(doc)
 
             # ── Set document metadata ────────────────────────────────────────
             stamp_document_metadata(doc, filename, input_path)
 
-            # ── Insert invisible text into original pages ────────────────────
-            page_count = min(len(doc), len(ocr_pages))
-            logger.info(f"Inserting text into {page_count} pages…")
+            logger.info(f"Rendering {n_pages} pages at {DPI} DPI for OCR, one page at a time…")
+            total_elements = 0
 
-            for page_num in range(page_count):
-                page     = doc[page_num]
-                elements = ocr_pages[page_num]
-                pil_img  = pil_images[page_num]
+            for page_num in range(n_pages):
+                page = doc[page_num]
+
+                # ── Render this page and run OCR on it ───────────────────────
+                pil_img = page_to_pil(page, dpi=DPI)
+                img_w, img_h = pil_img.size
+                elements = create_page_ocr_elements(pil_img, page_num + 1, n_pages, filename)
+                del pil_img
+                free_device_memory()
+                total_elements += len(elements)
 
                 # ── Strip any pre-existing text layer ────────────────────────
                 # Scans that were previously OCR'd (or partially searchable)
@@ -715,7 +835,6 @@ def process_single_pdf_ocr(input_path: str, output_path: str) -> bool:
                     page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
 
                 # Scale: pixel-space → PDF point-space
-                img_w, img_h = pil_img.size
                 page_w = page.rect.width
                 page_h = page.rect.height
                 sx     = page_w / img_w
@@ -762,6 +881,12 @@ def process_single_pdf_ocr(input_path: str, output_path: str) -> bool:
                         logger.error(f"Failed to insert text on page {page_num+1}: {e}")
 
                 logger.info(f"Page {page_num+1}: inserted {inserted}/{len(elements)} text elements")
+                del elements
+
+            logger.info(
+                f"OCR extraction complete: {total_elements} total text elements "
+                f"across {n_pages} pages"
+            )
 
             # ── Save with deflate; do NOT re-encode images ───────────────────
             doc.save(
@@ -805,6 +930,8 @@ def process_single_pdf_ocr(input_path: str, output_path: str) -> bool:
         import traceback
         traceback.print_exc()
         return False
+    finally:
+        free_device_memory()
 
 
 # ---------------- Compression (Size Targeting) ----------------
@@ -885,6 +1012,8 @@ def compress_to_target_size(input_pdf: Path, output_pdf: Path, original_size: in
 
 # ---------------- Main ----------------
 def main():
+    global seg_model, processor, trocr_model
+
     logger.info(f"{APP_NAME} {APP_VERSION} ({APP_SCRIPT}) by {APP_AUTHOR}, {APP_INSTITUTION} — "
                 f"{APP_LICENSE} licence — {APP_URL}")
     logger.info(f"Run {RUN_ID}")
@@ -896,18 +1025,20 @@ def main():
         sys.exit(1)
     output_folder.mkdir(exist_ok=True)
 
-    pdf_files = list(input_folder.glob("*.pdf"))
+    pdf_files = sorted(input_folder.glob("*.pdf"))
     if not pdf_files:
         logger.error(f"No PDF files in '{INPUT_DIR}'")
         sys.exit(1)
 
-    # Identify already-processed files and skip them
+    # Identify already-processed files and skip them — before any model loads
     skipped = []
     pending = []
+    summary = []
     for pdf_path in pdf_files:
         final_path = output_folder / f"{pdf_path.stem}.pdf"
-        if final_path.exists():
+        if SKIP_EXISTING_OUTPUT and final_path.exists():
             skipped.append(pdf_path.name)
+            summary.append((pdf_path.name, "SKIPPED", final_path.stat().st_size))
         else:
             pending.append(pdf_path)
 
@@ -917,6 +1048,13 @@ def main():
     if not pending:
         logger.info("All files have already been processed. Nothing to do.")
         return
+
+    # Load models once, only now that there is work to do
+    try:
+        seg_model, processor, trocr_model = load_models()
+    except Exception as e:
+        logger.error("Model loading failed. Exiting.")
+        sys.exit(1)
 
     logger.info(f"Processing {len(pending)} file(s) with TrOCR: {TROCR_MODEL_NAME}")
     logger.info("Target: Final size ≤ original + 15% (OCR text layer only; images untouched)")
@@ -930,6 +1068,9 @@ def main():
 
         if not process_single_pdf_ocr(str(pdf_path), str(ocr_temp_path)):
             logger.error(f"Skipping {pdf_path.name} due to OCR failure.")
+            summary.append((pdf_path.name, "FAILED", 0))
+            ocr_temp_path.unlink(missing_ok=True)
+            free_device_memory()
             continue
 
         final_path  = output_folder / f"{pdf_path.stem}.pdf"
@@ -942,14 +1083,21 @@ def main():
                 f"SUCCESS: {result_path.name} | {final_size // 1024} KB "
                 f"({size_increase:+.1f}% increase from original)"
             )
+            summary.append((pdf_path.name, "OK", final_size))
         else:
             logger.error(f"Failed to generate final output for {pdf_path.name}")
+            summary.append((pdf_path.name, "FAILED", 0))
 
         try:
             ocr_temp_path.unlink()
         except Exception as e:
             logger.warning(f"Could not delete temp file: {e}")
 
+        free_device_memory()
+
+    logger.info(f"\n{'=' * 60}\nSUMMARY\n{'=' * 60}")
+    for name, status, sz in summary:
+        logger.info(f"  {status:<8}  {name}  ({sz // 1024} KB)")
     logger.info(f"\nAll done! Output files in '{OUTPUT_DIR}/'")
 
 
